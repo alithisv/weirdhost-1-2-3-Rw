@@ -1081,13 +1081,12 @@ def xdotool_click(x, y):
     x, y = int(x), int(y)
     activate_browser_window()
     try:
-        # 模拟略带随机偏移的移动轨迹再点击
-        mid_x = max(10, x - random.randint(40, 90))
-        mid_y = max(10, y + random.randint(-25, 25))
+        mid_x = max(10, x - random.randint(50, 120))
+        mid_y = max(10, y + random.randint(-30, 30))
         subprocess.run(["xdotool", "mousemove", str(mid_x), str(mid_y)], timeout=2, stderr=subprocess.DEVNULL)
-        time.sleep(random.uniform(0.12, 0.25))
-        subprocess.run(["xdotool", "mousemove", str(x), str(y)], timeout=2, stderr=subprocess.DEVNULL)
         time.sleep(random.uniform(0.15, 0.30))
+        subprocess.run(["xdotool", "mousemove", str(x), str(y)], timeout=2, stderr=subprocess.DEVNULL)
+        time.sleep(random.uniform(0.18, 0.35))
         subprocess.run(["xdotool", "click", "1"], timeout=2, stderr=subprocess.DEVNULL)
         return True
     except Exception:
@@ -1097,6 +1096,48 @@ def xdotool_click(x, y):
         return True
     except Exception:
         return False
+
+
+def stealth_sleep(sb, seconds):
+    """在完全断连 ChromeDriver 的状态下等待，避免 CDP 检测干扰 Cloudflare 校验"""
+    disconnected = False
+    try:
+        if hasattr(sb, "disconnect"):
+            sb.disconnect()
+            disconnected = True
+        time.sleep(seconds)
+    finally:
+        if disconnected and hasattr(sb, "reconnect"):
+            sb.reconnect(5)
+
+
+def log_browser_env(sb):
+    """在访问目标站点前的空白页打印 WebGL 与视口信息，确认环境干净"""
+    try:
+        info = sb.execute_script("""
+            var c = document.createElement('canvas');
+            var gl = c.getContext('webgl') || c.getContext('experimental-webgl');
+            var renderer = 'NONE';
+            if (gl) {
+                var dbg = gl.getExtension('WEBGL_debug_renderer_info');
+                renderer = dbg ? gl.getParameter(dbg.UNMASKED_RENDERER_WEBGL) : gl.getParameter(gl.RENDERER);
+            }
+            return {
+                w: window.innerWidth,
+                h: window.innerHeight,
+                ow: window.outerWidth,
+                oh: window.outerHeight,
+                webgl: renderer,
+                wd: navigator.webdriver
+            };
+        """)
+        print(
+            f"[INFO] 浏览器自检 | 视口: {info.get('w')}x{info.get('h')} "
+            f"(窗口 {info.get('ow')}x{info.get('oh')}) | "
+            f"WebGL: {info.get('webgl')} | webdriver: {info.get('wd')}"
+        )
+    except Exception as e:
+        print(f"[WARN] 浏览器自检跳过: {e}")
 
 
 # ============================================================
@@ -1134,6 +1175,7 @@ def is_cf_challenge(sb):
                 body.includes('사람인지 확인하십시오') ||
                 body.includes('performing security verification') ||
                 body.includes('verify you are human') ||
+                body.includes('verifying you are human') ||
                 body.includes('checking if the site connection is secure') ||
                 body.includes('enable javascript and cookies to continue') ||
                 (body.includes('ray id:') && body.includes('cloudflare'))
@@ -1159,21 +1201,6 @@ def is_cf_challenge(sb):
         return False
 
 
-def wait_cf_cleared(sb, wait_sec=10):
-    """等待 Cloudflare 验证页彻底消失（连续 2 次确认，避免页面重载瞬间误判）"""
-    deadline = time.time() + wait_sec
-    clear_streak = 0
-    while time.time() < deadline:
-        if not is_cf_challenge(sb):
-            clear_streak += 1
-            if clear_streak >= 2:
-                return True
-        else:
-            clear_streak = 0
-        time.sleep(1)
-    return clear_streak >= 2
-
-
 def get_cf_challenge_checkbox_coords(sb):
     """定位 Cloudflare 全屏验证页中的 300x65 验证框及复选框坐标（兼容 Closed Shadow DOM）"""
     try:
@@ -1190,7 +1217,7 @@ def get_cf_challenge_checkbox_coords(sb):
                 var nodes = document.querySelectorAll(selectors[s]);
                 for (var i = 0; i < nodes.length; i++) {
                     var r = nodes[i].getBoundingClientRect();
-                    if (r.width >= 240 && r.width <= 420 && r.height >= 50 && r.height <= 110 && r.y >= 0) {
+                    if (r.width >= 240 && r.width <= 450 && r.height >= 50 && r.height <= 110 && r.y >= 0) {
                         candidates.push(r);
                     }
                 }
@@ -1237,95 +1264,110 @@ def get_cf_challenge_checkbox_coords(sb):
         return None
 
 
-def click_cf_checkbox_stealth(sb):
-    """断开 CDP 后用 xdotool 点击复选框，再重连，避免暴露 WebDriver 特征"""
+def click_cf_checkbox_stealth(sb, cached_abs=None, wait_after=10):
+    """断开 CDP 后用 xdotool 点击复选框，并在断连状态等待校验完成"""
+    abs_xy = None
     coords = get_cf_challenge_checkbox_coords(sb)
-    if not coords:
+    if coords:
+        try:
+            window_info = sb.execute_script("""
+                return {
+                    screenX: window.screenX || 0,
+                    screenY: window.screenY || 0,
+                    outerHeight: window.outerHeight,
+                    innerHeight: window.innerHeight
+                };
+            """)
+            chrome_bar_height = max(0, window_info["outerHeight"] - window_info["innerHeight"])
+            abs_x = int(coords["click_x"] + window_info["screenX"])
+            abs_y = int(coords["click_y"] + window_info["screenY"] + chrome_bar_height)
+            abs_xy = (abs_x, abs_y)
+        except Exception as e:
+            if _is_fatal_driver_error(e):
+                raise
+            print(f"[WARN]   获取窗口坐标失败: {e}")
+
+    if not abs_xy and cached_abs:
+        abs_xy = cached_abs
+        print(f"[INFO]   使用缓存坐标点击 CF 复选框 {abs_xy}...")
+
+    if not abs_xy:
         print("[WARN]   未定位到 CF 复选框区域")
-        return False
+        return None
 
-    try:
-        window_info = sb.execute_script("""
-            return {
-                screenX: window.screenX || 0,
-                screenY: window.screenY || 0,
-                outerHeight: window.outerHeight,
-                innerHeight: window.innerHeight
-            };
-        """)
-        chrome_bar_height = max(0, window_info["outerHeight"] - window_info["innerHeight"])
-        abs_x = int(coords["click_x"] + window_info["screenX"])
-        abs_y = int(coords["click_y"] + window_info["screenY"] + chrome_bar_height)
-    except Exception as e:
-        if _is_fatal_driver_error(e):
-            raise
-        print(f"[WARN]   获取窗口坐标失败: {e}")
-        return False
-
-    print(f"[INFO]   使用 xdotool 隐身点击 CF 复选框 ({abs_x}, {abs_y})...")
+    click_x = abs_xy[0] + random.randint(-3, 3)
+    click_y = abs_xy[1] + random.randint(-3, 3)
+    print(f"[INFO]   使用 xdotool 隐身点击 CF 复选框 ({click_x}, {click_y})，断连等待 {wait_after}s...")
     disconnected = False
     try:
         if hasattr(sb, "disconnect"):
             sb.disconnect()
             disconnected = True
             time.sleep(0.8)
-        xdotool_click(abs_x, abs_y)
-        time.sleep(6)
+        xdotool_click(click_x, click_y)
+        time.sleep(wait_after)
     finally:
         if disconnected and hasattr(sb, "reconnect"):
             try:
                 sb.reconnect(5)
             except Exception as e:
                 print(f"[WARN]   reconnect 异常: {e}")
-    return True
+    return abs_xy
 
 
-def handle_turnstile(sb, timeout=110, screenshot_prefix=""):
-    """处理 Cloudflare 全屏验证页，严禁使用 switch_to.frame 或样式篡改干扰"""
+def handle_turnstile(sb, target_url=None, screenshot_prefix=""):
+    """处理 Cloudflare 全屏验证页：校验全程断连 CDP，失败 2 次后刷新换新 cRay"""
     if not is_cf_challenge(sb):
         return True
 
-    print("[INFO]   检测到 Cloudflare 验证页，先等待 5 秒观察自动通过...")
-    if wait_cf_cleared(sb, 5):
-        print(f"[INFO]   CF 自动通过 ✅ (cf_clearance: {has_cf_clearance(sb)})")
-        return True
-
-    start = time.time()
-    attempt = 0
-
-    while time.time() - start < timeout:
-        attempt += 1
+    print("[INFO]   检测到 Cloudflare 验证页，断连静默等待 6 秒观察自动通过...")
+    stealth_sleep(sb, 6)
+    if not is_cf_challenge(sb):
+        time.sleep(1.5)
         if not is_cf_challenge(sb):
-            if wait_cf_cleared(sb, 2):
+            print(f"[INFO]   CF 自动通过 ✅ (cf_clearance: {has_cf_clearance(sb)})")
+            return True
+
+    cached_abs = None
+    refresh_url = target_url or f"https://{DOMAIN}/"
+
+    # 共 2 轮，每轮尝试 uc_gui_click_captcha + 隐身坐标点击；第 1 轮失败后整页重开换新 cRay
+    for round_idx in range(1, 3):
+        if round_idx > 1:
+            print(f"[INFO]   第 {round_idx - 1} 轮未通过，重新打开页面刷新 cRay...")
+            sb.uc_open_with_reconnect(refresh_url, reconnect_time=8)
+            cached_abs = None
+            if not is_cf_challenge(sb):
+                time.sleep(1.5)
+                if not is_cf_challenge(sb):
+                    print(f"[INFO]   刷新后 CF 自动通过 ✅ (cf_clearance: {has_cf_clearance(sb)})")
+                    return True
+
+        # 动作 A：SeleniumBase 内置 uc_gui_click_captcha + 断连等待
+        print(f"[INFO]   [第{round_idx}轮-A] 调用 uc_gui_click_captcha() 并断连等待 8s...")
+        try:
+            sb.uc_gui_click_captcha()
+        except Exception as e:
+            if _is_fatal_driver_error(e):
+                raise
+            print(f"[WARN]   uc_gui_click_captcha 异常: {e}")
+
+        stealth_sleep(sb, 8)
+        if not is_cf_challenge(sb):
+            time.sleep(1.5)
+            if not is_cf_challenge(sb):
                 print(f"[INFO]   CF 验证通过 ✅ (cf_clearance: {has_cf_clearance(sb)})")
                 return True
 
-        if attempt == 1:
-            print("[INFO]   [尝试1] 调用 uc_gui_handle_captcha()...")
-            try:
-                sb.uc_gui_handle_captcha()
-            except Exception as e:
-                if _is_fatal_driver_error(e):
-                    raise
-                print(f"[WARN]   uc_gui_handle_captcha 异常: {e}")
-            if wait_cf_cleared(sb, 10):
-                print(f"[INFO]   CF 验证通过 ✅ (cf_clearance: {has_cf_clearance(sb)})")
-                return True
-        elif attempt % 2 == 0:
-            print(f"[INFO]   [尝试{attempt}] 调用 uc_gui_click_captcha()...")
-            try:
-                sb.uc_gui_click_captcha()
-            except Exception as e:
-                if _is_fatal_driver_error(e):
-                    raise
-                print(f"[WARN]   uc_gui_click_captcha 异常: {e}")
-            if wait_cf_cleared(sb, 10):
-                print(f"[INFO]   CF 验证通过 ✅ (cf_clearance: {has_cf_clearance(sb)})")
-                return True
-        else:
-            print(f"[INFO]   [尝试{attempt}] 坐标定位 + 隐身点击...")
-            click_cf_checkbox_stealth(sb)
-            if wait_cf_cleared(sb, 8):
+        # 动作 B：坐标定位 + 断连 xdotool 点击 + 断连等待 10s
+        print(f"[INFO]   [第{round_idx}轮-B] 坐标定位 + 隐身点击...")
+        found_xy = click_cf_checkbox_stealth(sb, cached_abs=cached_abs, wait_after=10)
+        if found_xy:
+            cached_abs = found_xy
+
+        if not is_cf_challenge(sb):
+            time.sleep(1.5)
+            if not is_cf_challenge(sb):
                 print(f"[INFO]   CF 验证通过 ✅ (cf_clearance: {has_cf_clearance(sb)})")
                 return True
 
@@ -1334,7 +1376,7 @@ def handle_turnstile(sb, timeout=110, screenshot_prefix=""):
         cur_title = sb.get_title()
     except Exception:
         cur_url, cur_title = "Unknown", "Unknown"
-    print(f"[ERROR]  Cloudflare 验证超时 ❌ | URL: {cur_url} | Title: {cur_title}")
+    print(f"[ERROR]  Cloudflare 验证未通过 ❌ | URL: {cur_url} | Title: {cur_title}")
     if screenshot_prefix:
         try:
             sb.save_screenshot(f"{screenshot_prefix}_cf_fail.png")
@@ -1571,12 +1613,9 @@ def handle_renewal_popup(sb, screenshot_prefix="", timeout=90):
         sb.execute_script(EXPAND_POPUP_JS)
         time.sleep(0.3)
         click_turnstile_checkbox(sb)
-        for _ in range(8):
-            time.sleep(0.5)
-            if check_turnstile_solved_popup(sb):
-                print("[INFO]   Turnstile 已通过!")
-                break
+        stealth_sleep(sb, 5)
         if check_turnstile_solved_popup(sb):
+            print("[INFO]   Turnstile 已通过!")
             break
         sb.save_screenshot(
             f"{screenshot_prefix}_turnstile_{attempt}.png" if screenshot_prefix
@@ -1768,7 +1807,7 @@ def process_single_server(sb, server_info, cookie_name, cookie_value, cookie_str
         safe_open(sb, server_url)
         time.sleep(3)
         if is_cf_challenge(sb):
-            handle_turnstile(sb, screenshot_prefix=screenshot_prefix)
+            handle_turnstile(sb, target_url=server_url, screenshot_prefix=screenshot_prefix)
             time.sleep(2)
 
         if not is_logged_in(sb):
@@ -1776,7 +1815,7 @@ def process_single_server(sb, server_info, cookie_name, cookie_value, cookie_str
             safe_open(sb, server_url)
             time.sleep(3)
             if is_cf_challenge(sb):
-                handle_turnstile(sb, screenshot_prefix=screenshot_prefix)
+                handle_turnstile(sb, target_url=server_url, screenshot_prefix=screenshot_prefix)
                 time.sleep(2)
 
         if not is_logged_in(sb):
@@ -1910,10 +1949,18 @@ def process_single_account(sb, account, account_index, proxy_desc="直连"):
         "screenshot": None,
     }
 
+    # 设置规范窗口尺寸并自检 WebGL（在访问目标网站前执行）
+    try:
+        sb.set_window_rect(0, 0, 1920, 1080)
+    except Exception:
+        pass
+    log_browser_env(sb)
+
     # Step 1: 访问站点并通过 Cloudflare 验证
     print("[INFO] [步骤1] 访问站点并处理 Cloudflare 验证...")
-    sb.uc_open_with_reconnect(f"https://{DOMAIN}/", reconnect_time=6)
-    if not handle_turnstile(sb, timeout=110, screenshot_prefix=acc_prefix):
+    home_url = f"https://{DOMAIN}/"
+    sb.uc_open_with_reconnect(home_url, reconnect_time=8)
+    if not handle_turnstile(sb, target_url=home_url, screenshot_prefix=acc_prefix):
         print("[ERROR] Cloudflare 验证未通过")
         result["status"] = "error"
         result["message"] = "Cloudflare 验证未通过（请检查节点 IP 质量或重试）"
@@ -1927,12 +1974,12 @@ def process_single_account(sb, account, account_index, proxy_desc="直连"):
     # Step 2: 注入 Cookie 并登录
     print("[INFO] [步骤2] 注入 Cookie 并登录...")
     sb.add_cookie({"name": cookie_name, "value": cookie_value, "domain": DOMAIN, "path": "/"})
-    safe_open(sb, f"https://{DOMAIN}/")
+    safe_open(sb, home_url)
     time.sleep(3)
 
     if is_cf_challenge(sb):
         print("[WARN]   注入 Cookie 刷新后再次遇到 CF 验证，重新处理...")
-        if not handle_turnstile(sb, timeout=90, screenshot_prefix=acc_prefix):
+        if not handle_turnstile(sb, target_url=home_url, screenshot_prefix=acc_prefix):
             result["status"] = "error"
             result["message"] = "登录后再次触发 Cloudflare 验证且未通过"
             cf_ss = f"{acc_prefix}_cf_fail.png"
@@ -1946,7 +1993,7 @@ def process_single_account(sb, account, account_index, proxy_desc="直连"):
         safe_open(sb, f"https://{DOMAIN}/server/")
         time.sleep(3)
         if is_cf_challenge(sb):
-            handle_turnstile(sb, timeout=90, screenshot_prefix=acc_prefix)
+            handle_turnstile(sb, target_url=f"https://{DOMAIN}/server/", screenshot_prefix=acc_prefix)
             time.sleep(2)
 
     if not is_logged_in(sb):
@@ -2112,12 +2159,12 @@ def run_account_isolated(account, account_index):
         sb_kwargs = {
             "uc": True,
             "test": False,
-            "locale": "ko",
+            "locale": "en",
             "headless": False,
             "chromium_arg": (
-                "--window-position=0,0,--window-size=1920,1080,"
-                "--disable-dev-shm-usage,--no-sandbox,--disable-gpu,"
-                "--disable-software-rasterizer,--disable-background-timer-throttling"
+                "--no-sandbox,--disable-dev-shm-usage,"
+                "--use-gl=angle,--use-angle=swiftshader,--enable-unsafe-swiftshader,"
+                "--force-webrtc-ip-handling-policy=disable_non_proxied_udp"
             ),
         }
         if sb_proxy_arg:
