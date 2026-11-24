@@ -220,7 +220,11 @@ def parse_proxy_uri(uri):
     if not uri or uri.startswith("#"):
         return None, None
 
-    scheme = uri.split("://", 1)[0].lower() if "://" in uri else ""
+    if "://" not in uri:
+        print("[WARN] 代理配置不含 '://'，可能误填了 Cookie 或非节点链接，请检查对应的 PROXY_NODE_* Secret")
+        return None, None
+
+    scheme = uri.split("://", 1)[0].lower()
 
     try:
         # 1. Hysteria2: hy2:// 或 hysteria2://
@@ -864,43 +868,21 @@ def get_cookies_normalized(sb):
     return normalized
 
 
-def inject_cookie_cdp(sb, cookie_name, cookie_value, domain=DOMAIN, clear_session=True):
-    """优先使用底层 CDP Network.setCookie 写入 host-only HttpOnly Cookie，并清理匿名 session"""
-    method_used = "document.cookie"
-
-    try:
-        import mycdp
-        loop = getattr(sb.cdp, "loop", None)
-        page = getattr(sb.cdp, "page", None)
-        if loop and page:
-            if clear_session:
-                for cname in ("pterodactyl_session", cookie_name):
-                    try:
-                        loop.run_until_complete(
-                            page.send(mycdp.network.delete_cookies(name=cname, url=f"https://{domain}/"))
-                        )
-                    except Exception:
-                        pass
-            ok = loop.run_until_complete(
-                page.send(
-                    mycdp.network.set_cookie(
-                        name=cookie_name,
-                        value=cookie_value,
-                        url=f"https://{domain}/",
-                        path="/",
-                        secure=True,
-                        http_only=True,
-                        same_site=mycdp.network.CookieSameSite.LAX,
-                    )
-                )
-            )
-            if ok:
-                method_used = "cdp.network.set_cookie"
-    except Exception as e:
-        print(f"[WARN]   CDP 原生写 Cookie 降级 ({e})")
-
-    if method_used == "document.cookie":
-        # 不带 domain= 属性，确保为 host-only，与服务端下发一致
+def inject_cookie_cdp(sb, cookie_name, cookie_value, domain=DOMAIN):
+    """使用已验证可用的 document.cookie 注入到当前临时浏览器（不修改 GitHub Secrets）"""
+    cdp_js(
+        sb,
+        """
+        document.cookie = arguments[0] + "=" + arguments[1] +
+            "; path=/; domain=" + arguments[2] + "; Secure; SameSite=Lax";
+        """,
+        cookie_name,
+        cookie_value,
+        domain,
+    )
+    cookies = get_cookies_normalized(sb)
+    found = any(c["name"] == cookie_name and c["value"] for c in cookies)
+    if not found:
         cdp_js(
             sb,
             """
@@ -910,10 +892,9 @@ def inject_cookie_cdp(sb, cookie_name, cookie_value, domain=DOMAIN, clear_sessio
             cookie_name,
             cookie_value,
         )
-
-    cookies = get_cookies_normalized(sb)
-    found = any(c["name"] == cookie_name and c["value"] for c in cookies)
-    return found, method_used
+        cookies = get_cookies_normalized(sb)
+        found = any(c["name"] == cookie_name and c["value"] for c in cookies)
+    return found
 
 
 def get_xsrf_token_from_cookies(sb):
@@ -2089,9 +2070,10 @@ def process_single_server(sb, server_info, cookie_name, cookie_value, raw_cookie
 # ============================================================
 
 def _try_login_with_cookie(sb, cookie_name, val_to_inject, home_url, acc_prefix, tag="原始值"):
-    """写入 Cookie 并访问首页验证是否登录成功"""
-    injected, method_used = inject_cookie_cdp(sb, cookie_name, val_to_inject, DOMAIN, clear_session=True)
-    print(f"[INFO]   Cookie({tag}, 长度={len(val_to_inject)}) 写入: {'成功' if injected else '未确认'} ({method_used})")
+    """向当前临时浏览器注入 Cookie 并访问首页验证登录状态"""
+    injected = inject_cookie_cdp(sb, cookie_name, val_to_inject, DOMAIN)
+    preview = f"{val_to_inject[:6]}...{val_to_inject[-6:]}" if len(val_to_inject) > 16 else "***"
+    print(f"[INFO]   向浏览器注入 Cookie({tag}, 长度={len(val_to_inject)}, 片段={preview}): {'成功' if injected else '未确认'}")
     cdp_open(sb, home_url, wait=4)
 
     if is_cf_challenge(sb):
@@ -2103,7 +2085,6 @@ def _try_login_with_cookie(sb, cookie_name, val_to_inject, home_url, acc_prefix,
     if is_logged_in(sb):
         return "ok"
 
-    # 再等待 3 秒防止 SPA 页面还在渲染
     cdp_sleep(sb, 3)
     if is_logged_in(sb):
         return "ok"
@@ -2153,7 +2134,7 @@ def process_single_account(sb, account, account_index, proxy_desc="直连"):
 
     print(f"[INFO] ✅ 已离开 CF 验证页 | URL: {sb.cdp.get_current_url()} | Title: {sb.cdp.get_title()}")
 
-    # Step 2: 注入 Cookie 并登录（优先原始值；若带 URL 编码且失败则自动用解码值重试）
+    # Step 2: 注入 Cookie 并登录
     print("[INFO] [步骤2] 注入 Cookie 并登录...")
     active_raw_cookie = raw_cookie_value
     login_state = _try_login_with_cookie(sb, cookie_name, raw_cookie_value, home_url, acc_prefix, tag="原始值")
