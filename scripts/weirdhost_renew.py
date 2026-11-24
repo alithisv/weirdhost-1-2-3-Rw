@@ -1113,7 +1113,7 @@ def cdp_click_xpath(sb, xpath):
 # ============================================================
 
 def _set_react_input_value(sb, css_selector, value):
-    """兼容 React 受控输入框的原生 value setter 兜底"""
+    """兼容 React / Formik 受控输入框的原生 value setter 兜底"""
     return bool(cdp_js(
         sb,
         """
@@ -1124,6 +1124,7 @@ def _set_react_input_value(sb, css_selector, value):
         setter.call(el, arguments[1]);
         el.dispatchEvent(new Event('input', { bubbles: true }));
         el.dispatchEvent(new Event('change', { bubbles: true }));
+        el.dispatchEvent(new Event('blur', { bubbles: true }));
         return el.value === arguments[1];
         """,
         css_selector,
@@ -1132,18 +1133,11 @@ def _set_react_input_value(sb, css_selector, value):
 
 
 def _fill_input_humanlike(sb, css_selector, value):
-    """优先用 CDP 原生键入（对 reCAPTCHA v3 友好），若未写入再走 React setter 兜底"""
+    """优先用 CDP 原生键入（对 reCAPTCHA 友好），若未完整写入则走 React setter 兜底"""
     try:
-        cdp_js(
-            sb,
-            """
-            var el = document.querySelector(arguments[0]);
-            if (el) { el.focus(); el.select && el.select(); }
-            """,
-            css_selector,
-        )
+        _set_react_input_value(sb, css_selector, "")
         sb.cdp.click(css_selector)
-        cdp_sleep(sb, random.uniform(0.2, 0.45))
+        cdp_sleep(sb, random.uniform(0.2, 0.4))
         if hasattr(sb.cdp, "type"):
             sb.cdp.type(css_selector, value)
         elif hasattr(sb.cdp, "press_keys"):
@@ -1202,27 +1196,62 @@ def _detect_login_selectors(sb):
     ) or {}
 
 
+def _is_recaptcha_challenge_visible(sb):
+    """检测是否弹出了 Google reCAPTCHA 图片验证框"""
+    try:
+        return bool(cdp_js(
+            sb,
+            """
+            var frames = document.querySelectorAll('iframe[src*="recaptcha/api2/bframe"], iframe[src*="recaptcha/enterprise/bframe"]');
+            for (var i = 0; i < frames.length; i++) {
+                var r = frames[i].getBoundingClientRect();
+                var style = window.getComputedStyle(frames[i]);
+                if (r.width > 180 && r.height > 180 && style.visibility !== 'hidden' && style.display !== 'none' && parseFloat(style.opacity || '1') > 0) {
+                    return true;
+                }
+            }
+            return false;
+            """
+        ))
+    except Exception:
+        return False
+
+
 def _get_login_error_text(sb):
-    """提取登录页可能弹出的错误提示文案"""
+    """提取登录页报错提示（兼容 Pterodactyl 红色提示框与常见告警元素）"""
     try:
         return cdp_js(
             sb,
             """
+            var msgs = [];
             var selectors = [
                 '[role="alert"]',
                 '.alert-danger',
                 '.alert-error',
+                '[class*="bg-red"]',
+                '[class*="text-red"]',
                 '[class*="Alert"]',
                 '[class*="Error"]',
                 '[class*="error"]'
             ];
-            var msgs = [];
             for (var s = 0; s < selectors.length; s++) {
                 var nodes = document.querySelectorAll(selectors[s]);
                 for (var i = 0; i < nodes.length; i++) {
+                    if (nodes[i].tagName === 'BUTTON' || nodes[i].closest('button')) continue;
                     var t = (nodes[i].innerText || '').trim();
-                    if (t && t.length > 2 && t.length < 220 && !msgs.includes(t)) {
+                    if (t && t.length > 3 && t.length < 240 && !msgs.includes(t)) {
                         msgs.push(t);
+                    }
+                }
+            }
+            if (msgs.length === 0) {
+                var body = (document.body && document.body.innerText ? document.body.innerText : '');
+                var lines = body.split(/\\r?\\n/).map(function(x) { return x.trim(); }).filter(Boolean);
+                var hints = ['no account', 'credentials', 'incorrect', 'invalid', 'too many', 'recaptcha', 'captcha', '일치하는', '잘못', '실패', '오류', '차단'];
+                for (var j = 0; j < lines.length; j++) {
+                    var low = lines[j].toLowerCase();
+                    if (hints.some(function(h) { return low.includes(h); }) && !msgs.includes(lines[j])) {
+                        msgs.push(lines[j]);
                     }
                 }
             }
@@ -1234,7 +1263,7 @@ def _get_login_error_text(sb):
 
 
 def login_with_credentials_cdp(sb, email, password, acc_prefix):
-    """在 CDP 模式下通过邮箱 + 密码登录 Weirdhost，返回 (ok: bool, message: str)"""
+    """在 CDP 模式下通过邮箱 + 密码登录 Weirdhost，返回 (ok: bool, message: str, screenshot: str|None)"""
     print(f"[INFO]   使用邮箱密码登录: {mask_email(email)}...")
     cur_url = (sb.cdp.get_current_url() or "").lower()
     if "/auth/login" not in cur_url:
@@ -1245,10 +1274,9 @@ def login_with_credentials_cdp(sb, email, password, acc_prefix):
     if is_cf_challenge(sb):
         print("[INFO]   登录页触发 CF 验证，正在处理...")
         if not handle_turnstile(sb, target_url=LOGIN_URL, screenshot_prefix=acc_prefix):
-            return False, "登录页 Cloudflare 验证未通过"
+            return False, "登录页 Cloudflare 验证未通过", f"{acc_prefix}_cf_fail.png"
         cdp_sleep(sb, 2)
 
-    # 等待登录表单渲染
     selectors = {}
     for _ in range(12):
         selectors = _detect_login_selectors(sb)
@@ -1257,17 +1285,24 @@ def login_with_credentials_cdp(sb, email, password, acc_prefix):
         cdp_sleep(sb, 1)
 
     if not selectors.get("user") or not selectors.get("pass"):
-        return False, "未找到登录页账号或密码输入框"
+        ss_path = f"{acc_prefix}_login_fail.png"
+        safe_screenshot(sb, ss_path)
+        return False, "未找到登录页账号或密码输入框", ss_path
 
     if not _fill_input_humanlike(sb, selectors["user"], email):
-        return False, "填写账号邮箱失败"
+        ss_path = f"{acc_prefix}_login_fail.png"
+        safe_screenshot(sb, ss_path)
+        return False, "填写账号邮箱失败", ss_path
     cdp_sleep(sb, random.uniform(0.4, 0.9))
 
     if not _fill_input_humanlike(sb, selectors["pass"], password):
-        return False, "填写账号密码失败"
+        ss_path = f"{acc_prefix}_login_fail.png"
+        safe_screenshot(sb, ss_path)
+        return False, "填写账号密码失败", ss_path
     cdp_sleep(sb, random.uniform(0.8, 1.5))
 
-    # 如果页面有“记住登录”勾选框则顺便勾选
+    print(f"[INFO]   已填写表单 (邮箱长度={len(email)}, 密码长度={len(password)})")
+
     try:
         cdp_js(
             sb,
@@ -1279,7 +1314,6 @@ def login_with_credentials_cdp(sb, email, password, acc_prefix):
     except Exception:
         pass
 
-    # 点击登录按钮（优先 CDP 原生点击，失败则 JS 点击）
     submit_sel = selectors.get("submit")
     clicked = False
     if submit_sel:
@@ -1309,45 +1343,79 @@ def login_with_credentials_cdp(sb, email, password, acc_prefix):
         ))
 
     if not clicked:
-        return False, "未找到可点击的登录按钮"
+        ss_path = f"{acc_prefix}_login_fail.png"
+        safe_screenshot(sb, ss_path)
+        return False, "未找到可点击的登录按钮", ss_path
 
     print("[INFO]   已提交账号密码，等待跳转至面板...")
 
-    # 轮询等待登录跳转（最多 24 秒）
+    ss_path = f"{acc_prefix}_login_fail.png"
+    retried_enter = False
+
     for sec in range(1, 25):
         cdp_sleep(sb, 1)
 
         if is_cf_challenge(sb):
             print("[INFO]   提交登录后遇到 CF 验证，正在处理...")
             if not handle_turnstile(sb, target_url=f"https://{DOMAIN}/", screenshot_prefix=acc_prefix):
-                return False, "登录后 Cloudflare 验证未通过"
+                return False, "登录后 Cloudflare 验证未通过", f"{acc_prefix}_cf_fail.png"
             cdp_sleep(sb, 2)
 
         if is_logged_in(sb, allow_api_check=(sec >= 4)):
-            return True, "账密登录成功"
+            return True, "账密登录成功", None
 
-        # 检查是否停留在 2FA 或报错提示
         cur_url = (sb.cdp.get_current_url() or "").lower()
         if "/checkpoint" in cur_url or "/2fa" in cur_url:
-            return False, "该账号开启了二步验证 (2FA)，无法自动账密登录"
+            safe_screenshot(sb, ss_path)
+            return False, "该账号开启了二步验证 (2FA)，无法自动账密登录", ss_path
 
-        if sec >= 4 and "/auth/login" in cur_url:
+        if _is_recaptcha_challenge_visible(sb):
+            safe_screenshot(sb, ss_path)
+            return False, "触发了登录页 Google reCAPTCHA 图片验证（建议更换更干净的代理节点或先手动更新一次 Cookie）", ss_path
+
+        if sec >= 3 and "/auth/login" in cur_url:
             err_msg = _get_login_error_text(sb)
             if err_msg:
-                return False, f"账密登录被拒: {err_msg}"
+                safe_screenshot(sb, ss_path)
+                return False, f"账密登录被拒: {err_msg}", ss_path
 
-    # 兜底主动访问一次首页确认是否其实已经拿到 Session
+            # 第 5 秒仍无响应时，尝试在密码框按一次 Enter 触发 Formik 提交
+            if sec == 5 and not retried_enter:
+                retried_enter = True
+                try:
+                    cdp_js(
+                        sb,
+                        """
+                        var el = document.querySelector(arguments[0]);
+                        if (el) {
+                            el.focus();
+                            el.dispatchEvent(new KeyboardEvent('keydown', {key:'Enter', code:'Enter', keyCode:13, which:13, bubbles:true}));
+                            if (el.form && el.form.requestSubmit) el.form.requestSubmit();
+                        }
+                        """,
+                        selectors["pass"],
+                    )
+                except Exception:
+                    pass
+
+    # 先保留当前登录页的真实截图（避免跳转首页后清空报错提示和输入状态）
+    err_msg = _get_login_error_text(sb)
+    recaptcha_shown = _is_recaptcha_challenge_visible(sb)
+    safe_screenshot(sb, ss_path)
+
+    # 再兜底访问一次首页确认是否其实已经拿到 Session
     cdp_open(sb, f"https://{DOMAIN}/", wait=4)
     if is_cf_challenge(sb):
         handle_turnstile(sb, target_url=f"https://{DOMAIN}/", screenshot_prefix=acc_prefix)
         cdp_sleep(sb, 2)
     if is_logged_in(sb):
-        return True, "账密登录成功"
+        return True, "账密登录成功", None
 
-    err_msg = _get_login_error_text(sb)
+    if recaptcha_shown:
+        return False, "触发了登录页 Google reCAPTCHA 图片验证（建议更换更干净的代理节点或先手动更新一次 Cookie）", ss_path
     if err_msg:
-        return False, f"账密登录失败: {err_msg}"
-    return False, f"账密登录超时未跳转（可能密码错误或触发了登录页 reCAPTCHA，URL: {sb.cdp.get_current_url()}）"
+        return False, f"账密登录失败: {err_msg}", ss_path
+    return False, f"账密登录超时未跳转（请查看截图确认密码是否正确或是否触发登录验证，URL: {sb.cdp.get_current_url()}）", ss_path
 
 
 # ============================================================
@@ -2534,16 +2602,15 @@ def process_single_account(sb, account, account_index, proxy_desc="直连"):
     if login_state == "not_logged_in" and login_email and login_password:
         if cookie_name:
             print("[WARN]   Cookie 已失效，自动切换为邮箱密码重登兜底...")
-        ok, cred_msg = login_with_credentials_cdp(sb, login_email, login_password, acc_prefix)
+        ok, cred_msg, fail_ss = login_with_credentials_cdp(sb, login_email, login_password, acc_prefix)
         if ok:
             login_state = "ok"
             logged_in_by_password = True
             result["login_method"] = "邮箱密码(自动重登)" if cookie_name else "邮箱密码"
         else:
             print(f"[ERROR]  {cred_msg}")
-            ss_path = f"{acc_prefix}_login_fail.png"
-            if safe_screenshot(sb, ss_path):
-                result["screenshot"] = ss_path
+            if fail_ss and os.path.exists(fail_ss):
+                result["screenshot"] = fail_ss
             result["status"] = "error"
             result["message"] = cred_msg
             return result
