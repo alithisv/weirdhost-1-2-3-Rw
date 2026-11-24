@@ -11,8 +11,11 @@ import random
 import re
 import subprocess
 import json
-from datetime import datetime, timedelta
-from urllib.parse import unquote
+import socket
+import tempfile
+import urllib.request
+from datetime import datetime
+from urllib.parse import unquote, urlparse, parse_qs
 
 from seleniumbase import SB
 
@@ -27,7 +30,7 @@ sys.stdout.reconfigure(line_buffering=True)
 BASE_URL = "https://hub.weirdhost.xyz/server/"
 API_BASE_URL = "https://hub.weirdhost.xyz/api/client"
 DOMAIN = "hub.weirdhost.xyz"
-MAX_COOKIE_COUNT = 5
+MAX_COOKIE_COUNT = 10
 
 RENEWAL_BUTTON_SELECTORS = [
     "//button//span[contains(text(), '연장하기')]/parent::button",
@@ -79,6 +82,19 @@ def mask_server_id(server_id):
     return server_id[:2] + "*" * (len(server_id) - 4) + server_id[-2:]
 
 
+def mask_ip(ip):
+    if not ip:
+        return "Unknown"
+    if "." in ip:
+        parts = ip.split(".")
+        if len(parts) == 4:
+            return f"{parts[0]}.{parts[1]}.*.*"
+    if ":" in ip:
+        parts = ip.split(":")
+        return ":".join(parts[:2]) + ":*:*"
+    return mask_sensitive(ip, 2)
+
+
 def random_delay(min_sec=0.5, max_sec=2.0):
     time.sleep(random.uniform(min_sec, max_sec))
 
@@ -105,7 +121,7 @@ def calculate_remaining_time(expiry_str):
             except ValueError:
                 continue
         return "无法解析"
-    except:
+    except Exception:
         return "计算失败"
 
 
@@ -153,6 +169,441 @@ def build_server_url(server_id):
 
 
 # ============================================================
+#  sing-box 节点解析与本地代理管理
+# ============================================================
+
+def _b64_decode(data):
+    data = data.strip().replace("-", "+").replace("_", "/")
+    data += "=" * (-len(data) % 4)
+    return base64.b64decode(data).decode("utf-8", errors="ignore")
+
+
+def _get_qs_first(qs, key, default=""):
+    vals = qs.get(key)
+    return vals[0] if vals else default
+
+
+def _parse_bool(val):
+    return str(val).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _build_transport(net_type, path="", host="", service_name=""):
+    net_type = (net_type or "tcp").lower()
+    if net_type == "ws":
+        t = {"type": "ws", "path": path or "/"}
+        if host:
+            t["headers"] = {"Host": host}
+        return t
+    if net_type == "grpc":
+        return {"type": "grpc", "service_name": service_name or path or ""}
+    if net_type == "httpupgrade":
+        t = {"type": "httpupgrade", "path": path or "/"}
+        if host:
+            t["host"] = host
+        return t
+    if net_type in ("h2", "http"):
+        t = {"type": "http", "path": path or "/"}
+        if host:
+            t["host"] = [h.strip() for h in host.split(",") if h.strip()]
+        return t
+    return None
+
+
+def parse_proxy_uri(uri):
+    """解析常见代理节点链接为 sing-box outbound 配置，返回 (outbound_dict, label)"""
+    if not uri:
+        return None, None
+    uri = uri.strip()
+    if not uri or uri.startswith("#"):
+        return None, None
+
+    scheme = uri.split("://", 1)[0].lower() if "://" in uri else ""
+
+    try:
+        # 1. Hysteria2: hy2:// 或 hysteria2://
+        if scheme in ("hy2", "hysteria2"):
+            parsed = urlparse(uri)
+            qs = parse_qs(parsed.query)
+            host = parsed.hostname
+            port = parsed.port or 443
+            password = unquote(parsed.username or "")
+            if parsed.password:
+                password = f"{password}:{unquote(parsed.password)}"
+            sni = _get_qs_first(qs, "sni") or _get_qs_first(qs, "peer") or host
+            insecure = _parse_bool(_get_qs_first(qs, "insecure") or _get_qs_first(qs, "allowInsecure"))
+            alpn = _get_qs_first(qs, "alpn")
+
+            outbound = {
+                "type": "hysteria2",
+                "tag": "proxy",
+                "server": host,
+                "server_port": int(port),
+                "password": password,
+                "tls": {
+                    "enabled": True,
+                    "server_name": sni,
+                    "insecure": insecure,
+                },
+            }
+            if alpn:
+                outbound["tls"]["alpn"] = [a.strip() for a in alpn.split(",") if a.strip()]
+
+            obfs = _get_qs_first(qs, "obfs")
+            obfs_pw = _get_qs_first(qs, "obfs-password")
+            if obfs and obfs.lower() != "none":
+                outbound["obfs"] = {"type": obfs, "password": obfs_pw}
+
+            label = unquote(parsed.fragment) or f"hy2-{mask_sensitive(host, 2)}"
+            return outbound, label
+
+        # 2. VLESS: vless://
+        if scheme == "vless":
+            parsed = urlparse(uri)
+            qs = parse_qs(parsed.query)
+            host = parsed.hostname
+            port = parsed.port or 443
+            uuid = unquote(parsed.username or "")
+            security = (_get_qs_first(qs, "security") or "none").lower()
+            sni = _get_qs_first(qs, "sni") or _get_qs_first(qs, "peer") or host
+            fp = _get_qs_first(qs, "fp") or "chrome"
+            flow = _get_qs_first(qs, "flow")
+            net_type = _get_qs_first(qs, "type") or "tcp"
+            path = unquote(_get_qs_first(qs, "path"))
+            ws_host = _get_qs_first(qs, "host")
+            service_name = _get_qs_first(qs, "serviceName")
+            alpn = _get_qs_first(qs, "alpn")
+            insecure = _parse_bool(_get_qs_first(qs, "allowInsecure") or _get_qs_first(qs, "insecure"))
+
+            outbound = {
+                "type": "vless",
+                "tag": "proxy",
+                "server": host,
+                "server_port": int(port),
+                "uuid": uuid,
+            }
+            if flow:
+                outbound["flow"] = flow
+
+            if security == "reality":
+                pbk = _get_qs_first(qs, "pbk")
+                sid = _get_qs_first(qs, "sid")
+                outbound["tls"] = {
+                    "enabled": True,
+                    "server_name": sni,
+                    "utls": {"enabled": True, "fingerprint": fp},
+                    "reality": {"enabled": True, "public_key": pbk, "short_id": sid},
+                }
+            elif security == "tls":
+                tls_cfg = {
+                    "enabled": True,
+                    "server_name": sni,
+                    "insecure": insecure,
+                }
+                if fp:
+                    tls_cfg["utls"] = {"enabled": True, "fingerprint": fp}
+                if alpn:
+                    tls_cfg["alpn"] = [a.strip() for a in alpn.split(",") if a.strip()]
+                outbound["tls"] = tls_cfg
+
+            transport = _build_transport(net_type, path, ws_host, service_name)
+            if transport:
+                outbound["transport"] = transport
+
+            label = unquote(parsed.fragment) or f"vless-{mask_sensitive(host, 2)}"
+            return outbound, label
+
+        # 3. VMess: vmess://
+        if scheme == "vmess":
+            raw_b64 = uri[len("vmess://"):].split("#", 1)[0]
+            cfg = json.loads(_b64_decode(raw_b64))
+            host = cfg.get("add", "")
+            port = int(cfg.get("port", 443))
+            uuid = cfg.get("id", "")
+            aid = int(cfg.get("aid", 0) or 0)
+            scy = cfg.get("scy") or "auto"
+            net_type = cfg.get("net") or "tcp"
+            ws_host = cfg.get("host", "")
+            path = cfg.get("path", "")
+            tls_val = str(cfg.get("tls", "")).lower()
+            sni = cfg.get("sni") or ws_host or host
+            fp = cfg.get("fp", "")
+            alpn = cfg.get("alpn", "")
+
+            outbound = {
+                "type": "vmess",
+                "tag": "proxy",
+                "server": host,
+                "server_port": port,
+                "uuid": uuid,
+                "security": scy,
+                "alter_id": aid,
+            }
+            if tls_val in ("tls", "1", "true"):
+                tls_cfg = {
+                    "enabled": True,
+                    "server_name": sni,
+                    "insecure": True,
+                }
+                if fp:
+                    tls_cfg["utls"] = {"enabled": True, "fingerprint": fp}
+                if alpn:
+                    tls_cfg["alpn"] = [a.strip() for a in alpn.split(",") if a.strip()]
+                outbound["tls"] = tls_cfg
+
+            transport = _build_transport(net_type, path, ws_host, path)
+            if transport:
+                outbound["transport"] = transport
+
+            label = cfg.get("ps") or f"vmess-{mask_sensitive(host, 2)}"
+            return outbound, label
+
+        # 4. Trojan: trojan://
+        if scheme == "trojan":
+            parsed = urlparse(uri)
+            qs = parse_qs(parsed.query)
+            host = parsed.hostname
+            port = parsed.port or 443
+            password = unquote(parsed.username or "")
+            sni = _get_qs_first(qs, "sni") or _get_qs_first(qs, "peer") or host
+            fp = _get_qs_first(qs, "fp")
+            alpn = _get_qs_first(qs, "alpn")
+            insecure = _parse_bool(_get_qs_first(qs, "allowInsecure") or _get_qs_first(qs, "insecure"))
+            net_type = _get_qs_first(qs, "type") or "tcp"
+            path = unquote(_get_qs_first(qs, "path"))
+            ws_host = _get_qs_first(qs, "host")
+            service_name = _get_qs_first(qs, "serviceName")
+
+            tls_cfg = {
+                "enabled": True,
+                "server_name": sni,
+                "insecure": insecure,
+            }
+            if fp:
+                tls_cfg["utls"] = {"enabled": True, "fingerprint": fp}
+            if alpn:
+                tls_cfg["alpn"] = [a.strip() for a in alpn.split(",") if a.strip()]
+
+            outbound = {
+                "type": "trojan",
+                "tag": "proxy",
+                "server": host,
+                "server_port": int(port),
+                "password": password,
+                "tls": tls_cfg,
+            }
+            transport = _build_transport(net_type, path, ws_host, service_name)
+            if transport:
+                outbound["transport"] = transport
+
+            label = unquote(parsed.fragment) or f"trojan-{mask_sensitive(host, 2)}"
+            return outbound, label
+
+        # 5. Shadowsocks: ss://
+        if scheme == "ss":
+            body = uri[len("ss://"):]
+            frag = ""
+            if "#" in body:
+                body, frag = body.split("#", 1)
+            body = body.split("?", 1)[0]
+            if "@" in body:
+                userinfo, hostport = body.rsplit("@", 1)
+                if ":" not in userinfo:
+                    userinfo = _b64_decode(userinfo)
+                method, password = userinfo.split(":", 1)
+                parsed_hp = urlparse(f"//{hostport}")
+                host, port = parsed_hp.hostname, parsed_hp.port
+            else:
+                decoded = _b64_decode(body)
+                userinfo, hostport = decoded.rsplit("@", 1)
+                method, password = userinfo.split(":", 1)
+                parsed_hp = urlparse(f"//{hostport}")
+                host, port = parsed_hp.hostname, parsed_hp.port
+
+            outbound = {
+                "type": "shadowsocks",
+                "tag": "proxy",
+                "server": host,
+                "server_port": int(port),
+                "method": unquote(method),
+                "password": unquote(password),
+            }
+            label = unquote(frag) or f"ss-{mask_sensitive(host, 2)}"
+            return outbound, label
+
+        # 6. SOCKS5 / HTTP: socks5:// socks:// http:// https://
+        if scheme in ("socks5", "socks", "http", "https"):
+            parsed = urlparse(uri)
+            host = parsed.hostname
+            port = parsed.port or (1080 if "socks" in scheme else 8080)
+            outbound = {
+                "type": "socks" if "socks" in scheme else "http",
+                "tag": "proxy",
+                "server": host,
+                "server_port": int(port),
+            }
+            if parsed.username:
+                outbound["username"] = unquote(parsed.username)
+            if parsed.password:
+                outbound["password"] = unquote(parsed.password)
+            if scheme == "https":
+                outbound["tls"] = {"enabled": True, "server_name": host}
+
+            label = unquote(parsed.fragment) or f"{scheme}-{mask_sensitive(host, 2)}"
+            return outbound, label
+
+    except Exception as e:
+        print(f"[ERROR] 代理节点解析失败 ({scheme}): {e}")
+        return None, None
+
+    print(f"[WARN] 不支持的代理协议: {scheme}")
+    return None, None
+
+
+def _find_free_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+class SingBoxProxyManager:
+    """为单个账号启动独立的 sing-box 本地 mixed 代理"""
+
+    def __init__(self, proxy_uri):
+        self.proxy_uri = proxy_uri
+        self.process = None
+        self.config_path = None
+        self.local_port = None
+        self.label = ""
+        self.egress_ip = None
+
+    def start(self, verify_timeout=12):
+        outbound, label = parse_proxy_uri(self.proxy_uri)
+        if not outbound:
+            return False, "节点链接解析失败"
+
+        self.label = label
+        self.local_port = _find_free_port()
+
+        config = {
+            "log": {"level": "warn", "timestamp": False},
+            "inbounds": [
+                {
+                    "type": "mixed",
+                    "tag": "mixed-in",
+                    "listen": "127.0.0.1",
+                    "listen_port": self.local_port,
+                }
+            ],
+            "outbounds": [
+                outbound,
+                {"type": "direct", "tag": "direct"},
+            ],
+            "route": {
+                "final": "proxy"
+            },
+        }
+
+        fd, self.config_path = tempfile.mkstemp(prefix="singbox_", suffix=".json")
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(config, f, ensure_ascii=False, indent=2)
+
+        try:
+            self.process = subprocess.Popen(
+                ["sing-box", "run", "-c", self.config_path],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+        except FileNotFoundError:
+            self.stop()
+            return False, "未找到 sing-box 可执行文件，请检查工作流安装步骤"
+        except Exception as e:
+            self.stop()
+            return False, f"sing-box 启动异常: {e}"
+
+        # 等待本地端口就绪
+        port_ready = False
+        for _ in range(30):
+            if self.process.poll() is not None:
+                err_out = (self.process.stderr.read() or "").strip()[:300]
+                self.stop()
+                return False, f"sing-box 启动后立即退出: {err_out}"
+            try:
+                with socket.create_connection(("127.0.0.1", self.local_port), timeout=0.3):
+                    port_ready = True
+                    break
+            except OSError:
+                time.sleep(0.2)
+
+        if not port_ready:
+            self.stop()
+            return False, "sing-box 本地端口监听超时"
+
+        # 连通性与出口 IP 预检
+        proxy_url = f"http://127.0.0.1:{self.local_port}"
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
+        )
+        check_urls = [
+            "https://api.ipify.org",
+            "https://ifconfig.me/ip",
+            "http://ip-api.com/line/?fields=query",
+        ]
+        last_err = ""
+        for url in check_urls:
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "curl/8.0"})
+                with opener.open(req, timeout=verify_timeout) as resp:
+                    ip = resp.read().decode("utf-8", errors="ignore").strip().splitlines()[0]
+                    if ip:
+                        self.egress_ip = ip
+                        return True, ip
+            except Exception as e:
+                last_err = str(e)
+                continue
+
+        self.stop()
+        return False, f"节点连通性测试失败: {last_err[:120]}"
+
+    def stop(self):
+        if self.process:
+            try:
+                self.process.terminate()
+                self.process.wait(timeout=3)
+            except Exception:
+                try:
+                    self.process.kill()
+                except Exception:
+                    pass
+            self.process = None
+
+        if self.config_path and os.path.exists(self.config_path):
+            try:
+                os.remove(self.config_path)
+            except Exception:
+                pass
+            self.config_path = None
+
+
+def load_proxy_pool():
+    raw = os.environ.get("PROXY_NODES", "").strip()
+    if not raw:
+        return []
+    return [line.strip() for line in raw.splitlines() if line.strip() and not line.strip().startswith("#")]
+
+
+def get_proxy_for_account(account_index, proxy_pool):
+    """优先读取 PROXY_NODE_{i}，其次从 PROXY_NODES 按序号轮询分配"""
+    dedicated = os.environ.get(f"PROXY_NODE_{account_index}", "").strip()
+    if dedicated:
+        return dedicated, f"PROXY_NODE_{account_index}"
+    if proxy_pool:
+        node = proxy_pool[(account_index - 1) % len(proxy_pool)]
+        return node, f"PROXY_NODES[{(account_index - 1) % len(proxy_pool) + 1}]"
+    return None, None
+
+
+# ============================================================
 #  账号自动检测
 # ============================================================
 
@@ -188,6 +639,10 @@ def parse_account_config(raw_value):
 
 def detect_accounts():
     accounts = []
+    proxy_pool = load_proxy_pool()
+    if proxy_pool:
+        print(f"[INFO] 检测到公共节点池 PROXY_NODES: 共 {len(proxy_pool)} 个节点")
+
     for i in range(1, MAX_COOKIE_COUNT + 1):
         env_name = f"WEIRDHOST_COOKIE_{i}"
         raw = os.environ.get(env_name, "").strip()
@@ -197,11 +652,13 @@ def detect_accounts():
         config = parse_account_config(raw)
         if not config:
             print(f"[WARN] {env_name} 格式错误，跳过")
-            print(f"       正确格式: 备注-----remember_web_xxx=yyy")
+            print("       正确格式: 备注-----remember_web_xxx=yyy")
             continue
 
         remark = config["remark"] or f"账号{i}"
-        print(f"[INFO] 检测到 {env_name}: {mask_remark(remark)}")
+        proxy_uri, proxy_source = get_proxy_for_account(i, proxy_pool)
+        proxy_hint = f" | 代理: {proxy_source}" if proxy_uri else " | 代理: 直连"
+        print(f"[INFO] 检测到 {env_name}: {mask_remark(remark)}{proxy_hint}")
 
         accounts.append({
             "index": i,
@@ -210,6 +667,8 @@ def detect_accounts():
             "cookie_str": config["cookie_str"],
             "cookie_name": config["cookie_name"],
             "cookie_value": config["cookie_value"],
+            "proxy_uri": proxy_uri,
+            "proxy_source": proxy_source,
         })
 
     return accounts
@@ -295,7 +754,7 @@ async def update_github_secret(secret_name, secret_value):
                 "encrypted_value": encrypted_value, "key_id": pk_data["key_id"]
             }) as resp:
                 return resp.status in (201, 204)
-        except:
+        except Exception:
             return False
 
 
@@ -337,7 +796,7 @@ def get_xsrf_token_from_cookies(sb):
         for c in cookies:
             if c.get("name") == "XSRF-TOKEN":
                 return unquote(c.get("value", ""))
-    except:
+    except Exception:
         pass
     return None
 
@@ -355,7 +814,7 @@ def ts_exists(sb):
                 document.querySelector('iframe[src*="challenges.cloudflare.com"]')
             );
         """)
-    except:
+    except Exception:
         return False
 
 
@@ -365,7 +824,7 @@ def ts_solved(sb):
             var i = document.querySelector('input[name="cf-turnstile-response"]');
             return i && i.value && i.value.length > 20;
         """)
-    except:
+    except Exception:
         return False
 
 
@@ -398,7 +857,7 @@ def expand_turnstile(sb):
                 });
             })();
         """)
-    except:
+    except Exception:
         pass
 
 
@@ -424,7 +883,7 @@ def focus_turnstile_area(sb):
             return false;
         """)
         time.sleep(0.5)
-    except:
+    except Exception:
         pass
 
 
@@ -437,7 +896,7 @@ def handle_turnstile(sb, timeout=120):
         if ts_solved(sb) or not ts_exists(sb):
             print("[INFO]   自动解决成功 ✅")
             return True
-    except:
+    except Exception:
         pass
 
     print("[INFO]   自动解决未完成，进入手动处理 ...")
@@ -470,11 +929,11 @@ def handle_turnstile(sb, timeout=120):
                                     clicked = True
                                     print(f"[INFO]   在 iframe 中点击了 {sel}")
                                     break
-                            except:
+                            except Exception:
                                 pass
                         if clicked:
                             break
-                    except:
+                    except Exception:
                         pass
                     finally:
                         sb.driver.switch_to.default_content()
@@ -483,14 +942,14 @@ def handle_turnstile(sb, timeout=120):
             finally:
                 try:
                     sb.driver.switch_to.default_content()
-                except:
+                except Exception:
                     pass
 
             if not clicked:
                 try:
                     sb.uc_gui_click_captcha()
                     print("[INFO]   已调用 uc_gui_click_captcha（备用）")
-                except:
+                except Exception:
                     pass
             last_action = now
 
@@ -507,10 +966,11 @@ def handle_turnstile(sb, timeout=120):
 def check_turnstile_exists_popup(sb):
     try:
         return sb.execute_script(
-            "return document.querySelector('input[name=\"cf-turnstile-response\"]') !== null;"
+            'return document.querySelector(\'input[name="cf-turnstile-response"]\') !== null;'
         )
-    except:
+    except Exception:
         return False
+
 
 def check_turnstile_solved_popup(sb):
     try:
@@ -518,8 +978,9 @@ def check_turnstile_solved_popup(sb):
             var input = document.querySelector('input[name="cf-turnstile-response"]');
             return input && input.value && input.value.length > 20;
         """)
-    except:
+    except Exception:
         return False
+
 
 EXPAND_POPUP_JS = """
 (function() {
@@ -556,6 +1017,7 @@ EXPAND_POPUP_JS = """
 })();
 """
 
+
 def get_turnstile_checkbox_coords(sb):
     try:
         return sb.execute_script("""
@@ -585,8 +1047,9 @@ def get_turnstile_checkbox_coords(sb):
             }
             return null;
         """)
-    except:
+    except Exception:
         return None
+
 
 def activate_browser_window():
     try:
@@ -602,9 +1065,10 @@ def activate_browser_window():
             )
             time.sleep(0.2)
             return True
-    except:
+    except Exception:
         pass
     return False
+
 
 def xdotool_click(x, y):
     x, y = int(x), int(y)
@@ -614,13 +1078,14 @@ def xdotool_click(x, y):
         time.sleep(0.15)
         subprocess.run(["xdotool", "click", "1"], timeout=2, stderr=subprocess.DEVNULL)
         return True
-    except:
+    except Exception:
         pass
     try:
         os.system(f"xdotool mousemove {x} {y} click 1 2>/dev/null")
         return True
-    except:
+    except Exception:
         return False
+
 
 def click_turnstile_checkbox(sb):
     coords = get_turnstile_checkbox_coords(sb)
@@ -639,6 +1104,7 @@ def click_turnstile_checkbox(sb):
     except Exception as e:
         print(f"[ERROR] 坐标计算失败: {e}")
         return False
+
 
 def check_result_popup(sb):
     try:
@@ -664,8 +1130,9 @@ def check_result_popup(sb):
             }
             return null;
         """)
-    except:
+    except Exception:
         return None
+
 
 def check_popup_still_open(sb):
     try:
@@ -683,8 +1150,9 @@ def check_popup_still_open(sb):
             }
             return false;
         """)
-    except:
+    except Exception:
         return False
+
 
 def click_next_button(sb):
     try:
@@ -697,9 +1165,10 @@ def click_next_button(sb):
                 sb.click(sel)
                 print("[INFO] 已点击 NEXT 按钮")
                 return True
-    except:
+    except Exception:
         pass
     return False
+
 
 def handle_renewal_popup(sb, screenshot_prefix="", timeout=90):
     screenshot_name = f"{screenshot_prefix}_popup.png" if screenshot_prefix else "popup_fixed.png"
@@ -807,7 +1276,7 @@ def get_expiry_from_page(sb):
         if match:
             return match.group(1).strip()
         return "Unknown"
-    except:
+    except Exception:
         return "Unknown"
 
 
@@ -816,7 +1285,7 @@ def find_renewal_button(sb):
         try:
             if sb.is_element_present(selector):
                 return selector
-        except:
+        except Exception:
             continue
     return None
 
@@ -838,7 +1307,7 @@ def check_renewal_button_enabled(sb):
             return (False, False, None, "按钮元素无法访问")
         if is_disabled:
             return (True, False, xpath, "续期按钮已禁用（可能在冷却期）")
-    except:
+    except Exception:
         pass
 
     return (True, True, xpath, "")
@@ -857,11 +1326,12 @@ def is_logged_in(sb):
            sb.is_element_present("//a[contains(@href,'/server/')]"):
             return True
         return False
-    except:
+    except Exception:
         return False
 
 
 def check_and_update_cookie(sb, cookie_env, original_cookie_value, remark=""):
+    """检查 Cookie 是否变化；返回 (updated: bool, latest_cookie_value: str)"""
     try:
         cookies = sb.get_cookies()
         for cookie in cookies:
@@ -877,14 +1347,14 @@ def check_and_update_cookie(sb, cookie_env, original_cookie_value, remark=""):
                     print(f"[INFO]   Cookie 已变化，更新 {cookie_env}...")
                     if asyncio.run(update_github_secret(cookie_env, new_secret_value)):
                         print(f"[INFO]   ✅ {cookie_env} 已更新")
-                        return True
+                        return True, new_val
                     else:
                         print(f"[ERROR]  ❌ {cookie_env} 更新失败")
-                        return False
+                        return False, original_cookie_value
                 break
     except Exception as e:
         print(f"[ERROR]  Cookie 检查失败: {e}")
-    return False
+    return False, original_cookie_value
 
 
 # ============================================================
@@ -910,6 +1380,7 @@ def process_single_server(sb, server_info, cookie_name, cookie_value, cookie_str
         "message": "",
         "screenshot": None,
         "cookie_updated": False,
+        "latest_cookie_value": cookie_value,
     }
 
     server_url = build_server_url(server_id)
@@ -919,7 +1390,7 @@ def process_single_server(sb, server_info, cookie_name, cookie_value, cookie_str
     print(f"\n  {'─' * 50}")
     print(f"  [INFO] 服务器: {mask_server_id(server_id)} [{server_type}] {server_name}")
     print(f"  [INFO] 到期: {api_expiry} | 剩余: {calculate_remaining_time(api_expiry)} ({dd}天)")
-    print(f"  [INFO] 访问服务器页面...")
+    print("  [INFO] 访问服务器页面...")
 
     try:
         sb.uc_open_with_reconnect(server_url, reconnect_time=5)
@@ -934,16 +1405,16 @@ def process_single_server(sb, server_info, cookie_name, cookie_value, cookie_str
             ss_path = f"{screenshot_prefix}_login_fail.png"
             sb.save_screenshot(ss_path)
             srv_result.update(status="error", message="浏览器登录失败", screenshot=ss_path)
-            print(f"  [ERROR] 浏览器登录失败")
+            print("  [ERROR] 浏览器登录失败")
             return srv_result
 
-        print(f"  [INFO] 登录成功")
+        print("  [INFO] 登录成功")
 
         page_expiry = get_expiry_from_page(sb)
         if page_expiry != "Unknown":
             srv_result["original_expiry"] = page_expiry
 
-        print(f"  [INFO] 检查续期按钮...")
+        print("  [INFO] 检查续期按钮...")
         btn_found, btn_enabled, btn_xpath, btn_reason = check_renewal_button_enabled(sb)
 
         if not btn_found:
@@ -960,11 +1431,11 @@ def process_single_server(sb, server_info, cookie_name, cookie_value, cookie_str
             srv_result.update(status="skipped", message=btn_reason, screenshot=ss_path)
             return srv_result
 
-        print(f"  [INFO] 续期按钮可用，执行续期")
+        print("  [INFO] 续期按钮可用，执行续期")
 
         random_delay(1.0, 2.0)
         sb.click(btn_xpath)
-        print(f"  [INFO] 已点击续期按钮，等待弹窗...")
+        print("  [INFO] 已点击续期按钮，等待弹窗...")
         time.sleep(3)
 
         popup_result = handle_renewal_popup(sb, screenshot_prefix=screenshot_prefix, timeout=90)
@@ -994,20 +1465,22 @@ def process_single_server(sb, server_info, cookie_name, cookie_value, cookie_str
 
         if popup_result["status"] == "cooldown":
             srv_result.update(status="cooldown", message="冷却期内")
-            print(f"  [INFO] 冷却期内")
+            print("  [INFO] 冷却期内")
         elif original_dt and new_dt and new_dt > original_dt:
             diff_h = (new_dt - original_dt).total_seconds() / 3600
             srv_result.update(status="success", message=f"延长了 {diff_h:.1f} 小时")
             print(f"  [INFO] ✅ 续期成功！延长 {diff_h:.1f} 小时")
         elif popup_result["status"] == "success":
             srv_result.update(status="success", message="操作完成")
-            print(f"  [INFO] ✅ 续期成功")
+            print("  [INFO] ✅ 续期成功")
         else:
             srv_result.update(status=popup_result["status"], message=popup_result.get("message", "未知"))
             print(f"  [WARN] 结果: {popup_result['status']}")
 
-        if check_and_update_cookie(sb, cookie_env, cookie_value, remark):
+        updated, latest_val = check_and_update_cookie(sb, cookie_env, cookie_value, remark)
+        if updated:
             srv_result["cookie_updated"] = True
+            srv_result["latest_cookie_value"] = latest_val
 
         if not srv_result["screenshot"] or not os.path.exists(srv_result["screenshot"]):
             final_ss = f"{screenshot_prefix}_final.png"
@@ -1023,17 +1496,17 @@ def process_single_server(sb, server_info, cookie_name, cookie_value, cookie_str
             ss_path = f"{screenshot_prefix}_error.png"
             sb.save_screenshot(ss_path)
             srv_result["screenshot"] = ss_path
-        except:
+        except Exception:
             pass
 
     return srv_result
 
 
 # ============================================================
-#  单个账号处理
+#  单个账号处理（独立代理 + 独立浏览器实例）
 # ============================================================
 
-def process_single_account(sb, account, account_index):
+def process_single_account(sb, account, account_index, proxy_desc="直连"):
     remark = account.get("remark", f"账号{account_index + 1}")
     cookie_env = account.get("cookie_env", "")
     cookie_str = account.get("cookie_str", "")
@@ -1048,24 +1521,21 @@ def process_single_account(sb, account, account_index):
         "message": "",
         "servers": [],
         "cookie_updated": False,
+        "proxy_desc": proxy_desc,
     }
 
-    print(f"\n{'=' * 60}")
-    print(f"[INFO] 处理账号 [{account_index + 1}]: {mask_remark(remark)} ({cookie_env})")
-    print(f"{'=' * 60}")
-
     # Step 1: Turnstile (登录阶段)
-    print(f"[INFO] [步骤1] 访问站点并处理 Cloudflare 验证...")
+    print("[INFO] [步骤1] 访问站点并处理 Cloudflare 验证...")
     sb.uc_open_with_reconnect(f"https://{DOMAIN}/", reconnect_time=5)
     if not handle_turnstile(sb):
-        print(f"[ERROR] Turnstile 验证失败")
+        print("[ERROR] Turnstile 验证失败")
         result["status"] = "error"
         result["message"] = "Cloudflare Turnstile 验证失败"
         return result
-    print(f"[INFO] ✅ CF 验证通过")
+    print("[INFO] ✅ CF 验证通过")
 
     # Step 2: 注入 Cookie 并登录
-    print(f"[INFO] [步骤2] 注入 Cookie 并登录...")
+    print("[INFO] [步骤2] 注入 Cookie 并登录...")
     sb.add_cookie({"name": cookie_name, "value": cookie_value, "domain": DOMAIN, "path": "/"})
     sb.uc_open_with_reconnect(f"https://{DOMAIN}/", reconnect_time=5)
     time.sleep(3)
@@ -1076,25 +1546,26 @@ def process_single_account(sb, account, account_index):
         time.sleep(3)
 
     if not is_logged_in(sb):
-        ss_path = f"acc{account_index+1}_login_fail.png"
+        ss_path = f"acc{account_index + 1}_login_fail.png"
         sb.save_screenshot(ss_path)
         result["status"] = "cookie_invalid"
         result["message"] = "Cookie 失效或登录失败（Turnstile 通过后仍无法登录）"
         return result
 
     xsrf_token = get_xsrf_token_from_cookies(sb)
-    print(f"[INFO]   登录成功，已获取会话 Cookie")
+    print("[INFO]   登录成功，已获取会话 Cookie")
 
     # Step 3: 获取信息
-    print(f"[INFO] [步骤3] 获取账号信息...")
+    print("[INFO] [步骤3] 获取账号信息...")
     server_data = api_fetch_json(sb, f"{API_BASE_URL}?page=1", xsrf_token)
     if not server_data or server_data.get("error") == "unauthorized":
-        print(f"[ERROR]   获取服务器列表失败")
+        print("[ERROR]   获取服务器列表失败")
         result["status"] = "error"
         result["message"] = "无法获取服务器列表"
         return result
 
-    email_data = api_fetch_json(sb,
+    email_data = api_fetch_json(
+        sb,
         f"{API_BASE_URL}/account/activity?sort=-timestamp&page=1&include[]=actor",
         xsrf_token
     )
@@ -1135,7 +1606,7 @@ def process_single_account(sb, account, account_index):
         print(f"[INFO] 邮箱: {mask_email(email)}")
 
     if not servers:
-        print(f"[WARN] 该账号下没有服务器")
+        print("[WARN] 该账号下没有服务器")
         result["status"] = "no_server"
         result["message"] = "该账号下没有服务器"
         return result
@@ -1145,16 +1616,18 @@ def process_single_account(sb, account, account_index):
         print(f"  - {mask_server_id(s['identifier'])} [{s['server_type']}] {s['name']} | 到期: {s['expire']}")
 
     # Step 4: 逐个处理服务器
-    print(f"[INFO] [步骤4] 逐个处理服务器续期...")
+    print("[INFO] [步骤4] 逐个处理服务器续期...")
     server_results = []
+    current_cookie_value = cookie_value
     for srv_idx, server in enumerate(servers):
         ss_prefix = f"acc{account_index + 1}_srv{srv_idx + 1}"
         srv_result = process_single_server(
-            sb, server, cookie_name, cookie_value, cookie_str, cookie_env, remark, ss_prefix
+            sb, server, cookie_name, current_cookie_value, cookie_str, cookie_env, remark, ss_prefix
         )
         server_results.append(srv_result)
         if srv_result.get("cookie_updated"):
             result["cookie_updated"] = True
+            current_cookie_value = srv_result.get("latest_cookie_value", current_cookie_value)
         if srv_idx < len(servers) - 1:
             wait = random.randint(2, 4) if srv_result.get("status") == "skipped" else random.randint(5, 10)
             print(f"\n  [INFO] 等待 {wait} 秒后处理下一个服务器...")
@@ -1182,6 +1655,84 @@ def process_single_account(sb, account, account_index):
     return result
 
 
+def run_account_isolated(account, account_index):
+    """为单个账号准备独立 sing-box 代理和独立浏览器实例"""
+    remark = account.get("remark", f"账号{account_index + 1}")
+    cookie_env = account.get("cookie_env", "")
+    proxy_uri = account.get("proxy_uri")
+    fallback_direct = _parse_bool(os.environ.get("PROXY_FALLBACK_DIRECT", "true"))
+
+    print(f"\n{'=' * 60}")
+    print(f"[INFO] 处理账号 [{account_index + 1}]: {mask_remark(remark)} ({cookie_env})")
+    print(f"{'=' * 60}")
+
+    proxy_mgr = None
+    sb_proxy_arg = None
+    proxy_desc = "直连"
+
+    if proxy_uri:
+        print(f"[INFO] 正在通过 sing-box 启动独立代理 ({account.get('proxy_source')})...")
+        proxy_mgr = SingBoxProxyManager(proxy_uri)
+        ok, info = proxy_mgr.start()
+        if ok:
+            sb_proxy_arg = f"127.0.0.1:{proxy_mgr.local_port}"
+            proxy_desc = f"{proxy_mgr.label} ({mask_ip(proxy_mgr.egress_ip)})"
+            print(f"[INFO] ✅ 代理就绪 | 端口: {proxy_mgr.local_port} | 出口 IP: {mask_ip(proxy_mgr.egress_ip)}")
+        else:
+            print(f"[WARN] ⚠️ 代理启动失败: {info}")
+            proxy_mgr = None
+            if not fallback_direct:
+                return {
+                    "remark": remark,
+                    "cookie_env": cookie_env,
+                    "email": "Unknown",
+                    "status": "error",
+                    "message": f"代理启动失败且未启用直连回退: {info}",
+                    "servers": [],
+                    "cookie_updated": False,
+                    "proxy_desc": "代理失败",
+                }
+            print("[WARN] 已启用 PROXY_FALLBACK_DIRECT，回退到直连模式")
+            proxy_desc = "直连(代理回退)"
+
+    try:
+        sb_kwargs = {
+            "uc": True,
+            "test": True,
+            "locale": "ko",
+            "headless": False,
+            "chromium_arg": (
+                "--disable-dev-shm-usage,--no-sandbox,--disable-gpu,"
+                "--disable-software-rasterizer,--disable-background-timer-throttling"
+            ),
+        }
+        if sb_proxy_arg:
+            sb_kwargs["proxy"] = sb_proxy_arg
+
+        with SB(**sb_kwargs) as sb:
+            print(f"[INFO] 独立浏览器已启动 | 出口: {proxy_desc}")
+            return process_single_account(sb, account, account_index, proxy_desc=proxy_desc)
+
+    except Exception as e:
+        import traceback
+        print(f"[ERROR] 账号 {mask_remark(remark)} 浏览器异常: {repr(e)}")
+        traceback.print_exc()
+        return {
+            "remark": remark,
+            "cookie_env": cookie_env,
+            "email": "Unknown",
+            "status": "error",
+            "message": f"浏览器异常: {str(e)[:100]}",
+            "servers": [],
+            "cookie_updated": False,
+            "proxy_desc": proxy_desc,
+        }
+    finally:
+        if proxy_mgr:
+            proxy_mgr.stop()
+            print("[INFO] sing-box 代理已关闭")
+
+
 # ============================================================
 #  单账号 TG 通知
 # ============================================================
@@ -1192,16 +1743,20 @@ def send_account_notification(result):
     cookie_updated = result.get("cookie_updated", False)
     servers = result.get("servers", [])
     status = result.get("status", "unknown")
+    proxy_desc = result.get("proxy_desc", "直连")
 
     account_display = email if email and email != "Unknown" else remark
-    lines = [f"账号：{account_display}"]
+    lines = [
+        f"账号：{account_display}",
+        f"出口：{proxy_desc}",
+    ]
 
     if status == "cookie_invalid":
         lines.append("状态：⚠️ Cookie 已失效，请及时更新 WEIRDHOST_COOKIE_*")
-        screenshot = None
     elif status == "no_server":
         lines.append("状态：⚠️ 没有服务器")
-        screenshot = None
+    elif status == "error" and not servers:
+        lines.append(f"状态：❌ {result.get('message', '未知错误')}")
     else:
         for s in servers:
             lines.append("")
@@ -1274,8 +1829,6 @@ def add_server_time():
         print("\n请在 GitHub Secrets 中设置 WEIRDHOST_COOKIE_1 ~ WEIRDHOST_COOKIE_5")
         print("\n格式: 备注-----remember_web_xxx=yyy")
         print("示例: 我的账号-----remember_web_59ba36addc2b2f940CCCC=XXXXXXXXXXX")
-        print("\n也支持纯 Cookie 格式 (无备注):")
-        print("  remember_web_59ba36addc2b2f940CCCC=XXXXXXXXXXX")
         print("=" * 60)
 
         sync_tg_notify(
@@ -1288,44 +1841,20 @@ def add_server_time():
         return
 
     print("=" * 60)
-    print(f"[INFO] Weirdhost 自动续期")
+    print("[INFO] Weirdhost 多账号自动续期 (独立浏览器 + sing-box 代理隔离)")
     print(f"[INFO] 共 {len(accounts)} 个账号")
     print("=" * 60)
 
     results = []
+    for i, account in enumerate(accounts):
+        result = run_account_isolated(account, i)
+        results.append(result)
+        send_account_notification(result)
 
-    try:
-        with SB(
-            uc=True,
-            test=True,
-            locale="ko",
-            headless=False,
-            chromium_arg="--disable-dev-shm-usage,--no-sandbox,--disable-gpu,--disable-software-rasterizer,--disable-background-timer-throttling"
-        ) as sb:
-            print("\n[INFO] 浏览器已启动")
-
-            for i, account in enumerate(accounts):
-                result = process_single_account(sb, account, i)
-                results.append(result)
-
-                send_account_notification(result)
-
-                if i < len(accounts) - 1:
-                    if result.get("status") == "skipped":
-                        wait_time = random.randint(2, 4)
-                    else:
-                        wait_time = random.randint(5, 10)
-                    print(f"\n[INFO] 等待 {wait_time} 秒后处理下一个账号...")
-                    time.sleep(wait_time)
-
-    except Exception as e:
-        import traceback
-        print(f"\n[ERROR] 浏览器异常: {repr(e)}")
-        traceback.print_exc()
-
-        if not results:
-            sync_tg_notify(f"🔔 <b>Weirdhost</b>\n\n❌ 浏览器启动失败\n\n<code>{repr(e)}</code>")
-        return
+        if i < len(accounts) - 1:
+            wait_time = random.randint(2, 4) if result.get("status") == "skipped" else random.randint(5, 10)
+            print(f"\n[INFO] 等待 {wait_time} 秒后处理下一个账号...")
+            time.sleep(wait_time)
 
     print(f"\n{'=' * 60}")
     print("[INFO] 全部处理完成")
@@ -1340,7 +1869,7 @@ def add_server_time():
         srv_count = len(r.get("servers", []))
         email_display = mask_email(r.get("email", ""))
         remark_display = mask_remark(r.get("remark", "?"))
-        print(f"  {icon} {remark_display} ({email_display}) | "
+        print(f"  {icon} {remark_display} ({email_display}) | 出口: {r.get('proxy_desc', '直连')} | "
               f"{srv_count} 个服务器 | {r['status']} | {r.get('message', '')}")
 
 
