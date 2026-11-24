@@ -100,6 +100,43 @@ def random_delay(min_sec=0.5, max_sec=2.0):
     time.sleep(random.uniform(min_sec, max_sec))
 
 
+def _is_fatal_driver_error(exc):
+    msg = f"{type(exc).__name__}: {exc}".lower()
+    keywords = (
+        "connection refused",
+        "maxretryerror",
+        "newconnectionerror",
+        "invalid session id",
+        "no such window",
+        "target window already closed",
+        "chrome not reachable",
+        "disconnected",
+    )
+    return any(k in msg for k in keywords)
+
+
+def safe_open(sb, url, timeout=45):
+    """常规跳转并限制页面加载超时，避免广告脚本拖死或反复断连 ChromeDriver"""
+    try:
+        sb.driver.set_page_load_timeout(timeout)
+    except Exception:
+        pass
+    try:
+        sb.open(url)
+    except Exception as e:
+        if _is_fatal_driver_error(e):
+            raise
+        err_str = str(e).lower()
+        if "timeout" in err_str or "timed out" in err_str:
+            print(f"[WARN]   页面加载超过 {timeout}s，强制停止后续资源加载并继续...")
+            try:
+                sb.execute_script("window.stop();")
+            except Exception:
+                pass
+        else:
+            raise
+
+
 def calculate_remaining_time(expiry_str):
     try:
         for fmt in ["%Y-%m-%d %H:%M:%S", "%Y-%m-%d"]:
@@ -863,8 +900,9 @@ def get_xsrf_token_from_cookies(sb):
         for c in cookies:
             if c.get("name") == "XSRF-TOKEN":
                 return unquote(c.get("value", ""))
-    except Exception:
-        pass
+    except Exception as e:
+        if _is_fatal_driver_error(e):
+            raise
     return None
 
 
@@ -905,7 +943,9 @@ def get_power_buttons_from_dom(sb):
                 stop: findBtn(['stop', '정지', '중지'])
             };
         """)
-    except Exception:
+    except Exception as e:
+        if _is_fatal_driver_error(e):
+            raise
         return {"start": {"found": False, "disabled": True}, "stop": {"found": False, "disabled": True}}
 
 
@@ -929,7 +969,9 @@ def click_start_button_dom(sb):
             }
             return false;
         """)
-    except Exception:
+    except Exception as e:
+        if _is_fatal_driver_error(e):
+            raise
         return False
 
 
@@ -1025,7 +1067,9 @@ def ts_exists(sb):
                 document.querySelector('iframe[src*="challenges.cloudflare.com"]')
             );
         """)
-    except Exception:
+    except Exception as e:
+        if _is_fatal_driver_error(e):
+            raise
         return False
 
 
@@ -1035,7 +1079,9 @@ def ts_solved(sb):
             var i = document.querySelector('input[name="cf-turnstile-response"]');
             return i && i.value && i.value.length > 20;
         """)
-    except Exception:
+    except Exception as e:
+        if _is_fatal_driver_error(e):
+            raise
         return False
 
 
@@ -1068,8 +1114,9 @@ def expand_turnstile(sb):
                 });
             })();
         """)
-    except Exception:
-        pass
+    except Exception as e:
+        if _is_fatal_driver_error(e):
+            raise
 
 
 def focus_turnstile_area(sb):
@@ -1094,8 +1141,9 @@ def focus_turnstile_area(sb):
             return false;
         """)
         time.sleep(0.5)
-    except Exception:
-        pass
+    except Exception as e:
+        if _is_fatal_driver_error(e):
+            raise
 
 
 def handle_turnstile(sb, timeout=120):
@@ -1107,8 +1155,9 @@ def handle_turnstile(sb, timeout=120):
         if ts_solved(sb) or not ts_exists(sb):
             print("[INFO]   自动解决成功 ✅")
             return True
-    except Exception:
-        pass
+    except Exception as e:
+        if _is_fatal_driver_error(e):
+            raise
 
     print("[INFO]   自动解决未完成，进入手动处理 ...")
     start = time.time()
@@ -1149,6 +1198,8 @@ def handle_turnstile(sb, timeout=120):
                     finally:
                         sb.driver.switch_to.default_content()
             except Exception as e:
+                if _is_fatal_driver_error(e):
+                    raise
                 print(f"[WARN]   iframe 点击异常: {e}")
             finally:
                 try:
@@ -1160,8 +1211,9 @@ def handle_turnstile(sb, timeout=120):
                 try:
                     sb.uc_gui_click_captcha()
                     print("[INFO]   已调用 uc_gui_click_captcha（备用）")
-                except Exception:
-                    pass
+                except Exception as e:
+                    if _is_fatal_driver_error(e):
+                        raise
             last_action = now
 
         time.sleep(2)
@@ -1179,7 +1231,9 @@ def check_turnstile_exists_popup(sb):
         return sb.execute_script(
             'return document.querySelector(\'input[name="cf-turnstile-response"]\') !== null;'
         )
-    except Exception:
+    except Exception as e:
+        if _is_fatal_driver_error(e):
+            raise
         return False
 
 
@@ -1189,7 +1243,9 @@ def check_turnstile_solved_popup(sb):
             var input = document.querySelector('input[name="cf-turnstile-response"]');
             return input && input.value && input.value.length > 20;
         """)
-    except Exception:
+    except Exception as e:
+        if _is_fatal_driver_error(e):
+            raise
         return False
 
 
@@ -1258,7 +1314,9 @@ def get_turnstile_checkbox_coords(sb):
             }
             return null;
         """)
-    except Exception:
+    except Exception as e:
+        if _is_fatal_driver_error(e):
+            raise
         return None
 
 
@@ -1313,6 +1371,8 @@ def click_turnstile_checkbox(sb):
         abs_y = coords["click_y"] + window_info["screenY"] + chrome_bar_height
         return xdotool_click(abs_x, abs_y)
     except Exception as e:
+        if _is_fatal_driver_error(e):
+            raise
         print(f"[ERROR] 坐标计算失败: {e}")
         return False
 
@@ -1341,7 +1401,9 @@ def check_result_popup(sb):
             }
             return null;
         """)
-    except Exception:
+    except Exception as e:
+        if _is_fatal_driver_error(e):
+            raise
         return None
 
 
@@ -1361,7 +1423,9 @@ def check_popup_still_open(sb):
             }
             return false;
         """)
-    except Exception:
+    except Exception as e:
+        if _is_fatal_driver_error(e):
+            raise
         return False
 
 
@@ -1487,7 +1551,9 @@ def get_expiry_from_page(sb):
         if match:
             return match.group(1).strip()
         return "Unknown"
-    except Exception:
+    except Exception as e:
+        if _is_fatal_driver_error(e):
+            raise
         return "Unknown"
 
 
@@ -1496,7 +1562,9 @@ def find_renewal_button(sb):
         try:
             if sb.is_element_present(selector):
                 return selector
-        except Exception:
+        except Exception as e:
+            if _is_fatal_driver_error(e):
+                raise
             continue
     return None
 
@@ -1518,8 +1586,9 @@ def check_renewal_button_enabled(sb):
             return (False, False, None, "按钮元素无法访问")
         if is_disabled:
             return (True, False, xpath, "续期按钮已禁用（可能在冷却期）")
-    except Exception:
-        pass
+    except Exception as e:
+        if _is_fatal_driver_error(e):
+            raise
 
     return (True, True, xpath, "")
 
@@ -1537,7 +1606,9 @@ def is_logged_in(sb):
            sb.is_element_present("//a[contains(@href,'/server/')]"):
             return True
         return False
-    except Exception:
+    except Exception as e:
+        if _is_fatal_driver_error(e):
+            raise
         return False
 
 
@@ -1564,6 +1635,8 @@ def check_and_update_cookie(sb, cookie_env, original_cookie_value, remark=""):
                         return False, original_cookie_value
                 break
     except Exception as e:
+        if _is_fatal_driver_error(e):
+            raise
         print(f"[ERROR]  Cookie 检查失败: {e}")
     return False, original_cookie_value
 
@@ -1605,12 +1678,15 @@ def process_single_server(sb, server_info, cookie_name, cookie_value, cookie_str
     print("  [INFO] 访问服务器页面...")
 
     try:
-        sb.uc_open_with_reconnect(server_url, reconnect_time=5)
+        safe_open(sb, server_url)
         time.sleep(3)
+        if ts_exists(sb):
+            handle_turnstile(sb)
+            time.sleep(2)
 
         if not is_logged_in(sb):
             sb.add_cookie({"name": cookie_name, "value": cookie_value, "domain": DOMAIN, "path": "/"})
-            sb.uc_open_with_reconnect(server_url, reconnect_time=5)
+            safe_open(sb, server_url)
             time.sleep(3)
 
         if not is_logged_in(sb):
@@ -1667,11 +1743,11 @@ def process_single_server(sb, server_info, cookie_name, cookie_value, cookie_str
             if new_info and new_info.get("success"):
                 new_expiry = new_info.get("data", {}).get("expire", srv_result["original_expiry"])
             else:
-                sb.uc_open_with_reconnect(server_url, reconnect_time=3)
+                safe_open(sb, server_url)
                 time.sleep(3)
                 new_expiry = get_expiry_from_page(sb)
         else:
-            sb.uc_open_with_reconnect(server_url, reconnect_time=3)
+            safe_open(sb, server_url)
             time.sleep(3)
             new_expiry = get_expiry_from_page(sb)
 
@@ -1709,12 +1785,13 @@ def process_single_server(sb, server_info, cookie_name, cookie_value, cookie_str
         print(f"  [ERROR] 异常: {repr(e)}")
         traceback.print_exc()
         srv_result.update(status="error", message=str(e)[:100])
-        try:
-            ss_path = f"{screenshot_prefix}_error.png"
-            sb.save_screenshot(ss_path)
-            srv_result["screenshot"] = ss_path
-        except Exception:
-            pass
+        if not _is_fatal_driver_error(e):
+            try:
+                ss_path = f"{screenshot_prefix}_error.png"
+                sb.save_screenshot(ss_path)
+                srv_result["screenshot"] = ss_path
+            except Exception:
+                pass
 
     return srv_result
 
@@ -1741,7 +1818,7 @@ def process_single_account(sb, account, account_index, proxy_desc="直连"):
         "proxy_desc": proxy_desc,
     }
 
-    # Step 1: Turnstile (登录阶段)
+    # Step 1: Turnstile (登录阶段，仅首次访问用 uc_open_with_reconnect)
     print("[INFO] [步骤1] 访问站点并处理 Cloudflare 验证...")
     sb.uc_open_with_reconnect(f"https://{DOMAIN}/", reconnect_time=5)
     if not handle_turnstile(sb):
@@ -1751,20 +1828,30 @@ def process_single_account(sb, account, account_index, proxy_desc="直连"):
         return result
     print("[INFO] ✅ CF 验证通过")
 
-    # Step 2: 注入 Cookie 并登录
+    # Step 2: 注入 Cookie 并登录（使用常规跳转，不再断连 ChromeDriver）
     print("[INFO] [步骤2] 注入 Cookie 并登录...")
     sb.add_cookie({"name": cookie_name, "value": cookie_value, "domain": DOMAIN, "path": "/"})
-    sb.uc_open_with_reconnect(f"https://{DOMAIN}/", reconnect_time=5)
+    safe_open(sb, f"https://{DOMAIN}/")
     time.sleep(3)
 
+    if ts_exists(sb):
+        handle_turnstile(sb)
+        time.sleep(2)
+
     if not is_logged_in(sb):
-        print("[WARN]   未检测到登录状态，尝试刷新...")
-        sb.uc_open_with_reconnect(f"https://{DOMAIN}/server/", reconnect_time=5)
+        print(f"[WARN]   未检测到登录状态 (当前 URL: {sb.get_current_url()})，尝试刷新...")
+        safe_open(sb, f"https://{DOMAIN}/server/")
         time.sleep(3)
+        if ts_exists(sb):
+            handle_turnstile(sb)
+            time.sleep(2)
 
     if not is_logged_in(sb):
         ss_path = f"acc{account_index + 1}_login_fail.png"
-        sb.save_screenshot(ss_path)
+        try:
+            sb.save_screenshot(ss_path)
+        except Exception:
+            pass
         result["status"] = "cookie_invalid"
         result["message"] = "Cookie 失效或登录失败（Turnstile 通过后仍无法登录）"
         return result
@@ -1912,10 +1999,11 @@ def run_account_isolated(account, account_index):
             print("[WARN] 已启用 PROXY_FALLBACK_DIRECT，回退到直连模式")
             proxy_desc = "直连(代理回退)"
 
+    account_result = None
     try:
         sb_kwargs = {
             "uc": True,
-            "test": True,
+            "test": False,
             "locale": "ko",
             "headless": False,
             "chromium_arg": (
@@ -1928,18 +2016,18 @@ def run_account_isolated(account, account_index):
 
         with SB(**sb_kwargs) as sb:
             print(f"[INFO] 独立浏览器已启动 | 出口: {proxy_desc}")
-            return process_single_account(sb, account, account_index, proxy_desc=proxy_desc)
+            account_result = process_single_account(sb, account, account_index, proxy_desc=proxy_desc)
 
     except Exception as e:
         import traceback
         print(f"[ERROR] 账号 {mask_remark(remark)} 浏览器异常: {repr(e)}")
         traceback.print_exc()
-        return {
+        account_result = {
             "remark": remark,
             "cookie_env": cookie_env,
             "email": "Unknown",
             "status": "error",
-            "message": f"浏览器异常: {str(e)[:100]}",
+            "message": f"浏览器异常: {str(e)[:120]}",
             "servers": [],
             "cookie_updated": False,
             "proxy_desc": proxy_desc,
@@ -1949,12 +2037,29 @@ def run_account_isolated(account, account_index):
             proxy_mgr.stop()
             print("[INFO] sing-box 代理已关闭")
 
+    if not isinstance(account_result, dict):
+        account_result = {
+            "remark": remark,
+            "cookie_env": cookie_env,
+            "email": "Unknown",
+            "status": "error",
+            "message": "浏览器会话异常退出（未返回结果）",
+            "servers": [],
+            "cookie_updated": False,
+            "proxy_desc": proxy_desc,
+        }
+
+    return account_result
+
 
 # ============================================================
 #  单账号 TG 通知
 # ============================================================
 
 def send_account_notification(result):
+    if not isinstance(result, dict):
+        return
+
     email = result.get("email", "Unknown")
     remark = result.get("remark", "")
     cookie_updated = result.get("cookie_updated", False)
