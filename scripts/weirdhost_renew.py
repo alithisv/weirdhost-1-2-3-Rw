@@ -1055,175 +1055,296 @@ def ensure_server_online(sb, server_id, xsrf_token=None):
 
 
 # ============================================================
-#  Turnstile 处理（登录阶段）
+#  X11 / xdotool 点击工具
 # ============================================================
 
-def ts_exists(sb):
+def activate_browser_window():
     try:
-        return sb.execute_script("""
-            return !!(
-                document.querySelector('input[name="cf-turnstile-response"]') ||
-                document.querySelector('.cf-turnstile') ||
-                document.querySelector('iframe[src*="challenges.cloudflare.com"]')
-            );
-        """)
+        result = subprocess.run(
+            ["xdotool", "search", "--onlyvisible", "--class", "chrome"],
+            capture_output=True, text=True, timeout=3
+        )
+        window_ids = [w for w in result.stdout.strip().split("\n") if w]
+        if window_ids:
+            subprocess.run(
+                ["xdotool", "windowactivate", window_ids[-1]],
+                timeout=2, stderr=subprocess.DEVNULL
+            )
+            time.sleep(0.2)
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def xdotool_click(x, y):
+    x, y = int(x), int(y)
+    activate_browser_window()
+    try:
+        # 模拟略带随机偏移的移动轨迹再点击
+        mid_x = max(10, x - random.randint(40, 90))
+        mid_y = max(10, y + random.randint(-25, 25))
+        subprocess.run(["xdotool", "mousemove", str(mid_x), str(mid_y)], timeout=2, stderr=subprocess.DEVNULL)
+        time.sleep(random.uniform(0.12, 0.25))
+        subprocess.run(["xdotool", "mousemove", str(x), str(y)], timeout=2, stderr=subprocess.DEVNULL)
+        time.sleep(random.uniform(0.15, 0.30))
+        subprocess.run(["xdotool", "click", "1"], timeout=2, stderr=subprocess.DEVNULL)
+        return True
+    except Exception:
+        pass
+    try:
+        os.system(f"xdotool mousemove {x} {y} click 1 2>/dev/null")
+        return True
+    except Exception:
+        return False
+
+
+# ============================================================
+#  Cloudflare 全屏验证处理（登录阶段）
+# ============================================================
+
+def has_cf_clearance(sb):
+    try:
+        for c in sb.get_cookies():
+            if c.get("name") == "cf_clearance" and c.get("value"):
+                return True
+    except Exception as e:
+        if _is_fatal_driver_error(e):
+            raise
+    return False
+
+
+def is_cf_challenge(sb):
+    """准确判断是否处于 Cloudflare 全屏验证页（兼容韩/英及 Closed Shadow DOM）"""
+    try:
+        return bool(sb.execute_script("""
+            var title = (document.title || '').toLowerCase();
+            var body = (document.body && document.body.innerText ? document.body.innerText : '').toLowerCase();
+            if (
+                title.includes('just a moment') ||
+                title.includes('잠시만') ||
+                title.includes('attention required') ||
+                title.includes('보안 확인') ||
+                title.includes('checking your browser')
+            ) {
+                return true;
+            }
+            if (
+                body.includes('보안 확인 수행 중') ||
+                body.includes('사람인지 확인하십시오') ||
+                body.includes('performing security verification') ||
+                body.includes('verify you are human') ||
+                body.includes('checking if the site connection is secure') ||
+                body.includes('enable javascript and cookies to continue') ||
+                (body.includes('ray id:') && body.includes('cloudflare'))
+            ) {
+                return true;
+            }
+            if (window._cf_chl_opt) {
+                return true;
+            }
+            if (
+                document.querySelector('#challenge-running') ||
+                document.querySelector('#challenge-stage') ||
+                document.querySelector('#challenge-form') ||
+                document.querySelector('#turnstile-wrapper')
+            ) {
+                return true;
+            }
+            return false;
+        """))
     except Exception as e:
         if _is_fatal_driver_error(e):
             raise
         return False
 
 
-def ts_solved(sb):
+def wait_cf_cleared(sb, wait_sec=10):
+    """等待 Cloudflare 验证页彻底消失（连续 2 次确认，避免页面重载瞬间误判）"""
+    deadline = time.time() + wait_sec
+    clear_streak = 0
+    while time.time() < deadline:
+        if not is_cf_challenge(sb):
+            clear_streak += 1
+            if clear_streak >= 2:
+                return True
+        else:
+            clear_streak = 0
+        time.sleep(1)
+    return clear_streak >= 2
+
+
+def get_cf_challenge_checkbox_coords(sb):
+    """定位 Cloudflare 全屏验证页中的 300x65 验证框及复选框坐标（兼容 Closed Shadow DOM）"""
     try:
         return sb.execute_script("""
-            var i = document.querySelector('input[name="cf-turnstile-response"]');
-            return i && i.value && i.value.length > 20;
-        """)
-    except Exception as e:
-        if _is_fatal_driver_error(e):
-            raise
-        return False
-
-
-def expand_turnstile(sb):
-    try:
-        sb.execute_script("""
-            (function() {
-                var ti = document.querySelector('input[name="cf-turnstile-response"]');
-                if (!ti) return;
-                var el = ti;
-                for (var i = 0; i < 20; i++) {
-                    el = el.parentElement;
-                    if (!el) break;
-                    var s = window.getComputedStyle(el);
-                    if (s.overflow === 'hidden') el.style.overflow = 'visible';
-                    el.style.minWidth = 'max-content';
-                }
-                document.querySelectorAll('.cf-turnstile').forEach(function(c) {
-                    c.style.overflow = 'visible';
-                    c.style.width = '300px';
-                    c.style.height = '65px';
-                });
-                document.querySelectorAll('iframe').forEach(function(f) {
-                    if (f.src && f.src.includes('challenges.cloudflare.com')) {
-                        f.style.width = '300px';
-                        f.style.height = '65px';
-                        f.style.visibility = 'visible';
-                        f.style.opacity = '1';
-                    }
-                });
-            })();
-        """)
-    except Exception as e:
-        if _is_fatal_driver_error(e):
-            raise
-
-
-def focus_turnstile_area(sb):
-    try:
-        sb.execute_script("""
-            const selectors = [
-                '.cf-turnstile',
-                'iframe[src*="challenges.cloudflare"]',
-                'input[name="cf-turnstile-response"]',
-                'label.cb-lb',
-                '.cb-lb',
-                'input[type="checkbox"]'
+            var candidates = [];
+            var selectors = [
+                'iframe[src*="challenges.cloudflare.com"]',
+                'iframe[src*="turnstile"]',
+                '#turnstile-wrapper',
+                '#challenge-stage div',
+                '.cf-turnstile'
             ];
-            for (const selector of selectors) {
-                const el = document.querySelector(selector);
-                if (el) {
-                    el.scrollIntoView({block: 'center', inline: 'center'});
-                    return true;
+            for (var s = 0; s < selectors.length; s++) {
+                var nodes = document.querySelectorAll(selectors[s]);
+                for (var i = 0; i < nodes.length; i++) {
+                    var r = nodes[i].getBoundingClientRect();
+                    if (r.width >= 240 && r.width <= 420 && r.height >= 50 && r.height <= 110 && r.y >= 0) {
+                        candidates.push(r);
+                    }
                 }
             }
-            window.scrollTo(0, Math.max(0, document.body.scrollHeight * 0.45));
-            return false;
+            if (candidates.length === 0) {
+                var input = document.querySelector('input[name="cf-turnstile-response"]');
+                if (input) {
+                    var el = input.parentElement;
+                    for (var j = 0; j < 6 && el; j++) {
+                        var r = el.getBoundingClientRect();
+                        if (r.width >= 200 && r.height >= 45 && r.height <= 120) {
+                            candidates.push(r);
+                            break;
+                        }
+                        el = el.parentElement;
+                    }
+                }
+            }
+            if (candidates.length === 0) {
+                var divs = document.querySelectorAll('div');
+                for (var k = 0; k < divs.length; k++) {
+                    var r = divs[k].getBoundingClientRect();
+                    if (r.width >= 285 && r.width <= 325 && r.height >= 58 && r.height <= 78 && r.y > 50) {
+                        candidates.push(r);
+                    }
+                }
+            }
+            if (candidates.length > 0) {
+                candidates.sort(function(a, b) {
+                    return Math.abs(a.width * a.height - 19500) - Math.abs(b.width * b.height - 19500);
+                });
+                var best = candidates[0];
+                return {
+                    x: best.x, y: best.y, width: best.width, height: best.height,
+                    click_x: Math.round(best.x + 28),
+                    click_y: Math.round(best.y + best.height / 2)
+                };
+            }
+            return null;
         """)
-        time.sleep(0.5)
     except Exception as e:
         if _is_fatal_driver_error(e):
             raise
+        return None
 
 
-def handle_turnstile(sb, timeout=120):
-    if not ts_exists(sb):
-        return True
-    print("[INFO]   检测到 Turnstile，尝试自动解决...")
+def click_cf_checkbox_stealth(sb):
+    """断开 CDP 后用 xdotool 点击复选框，再重连，避免暴露 WebDriver 特征"""
+    coords = get_cf_challenge_checkbox_coords(sb)
+    if not coords:
+        print("[WARN]   未定位到 CF 复选框区域")
+        return False
+
     try:
-        sb.uc_gui_handle_captcha()
-        if ts_solved(sb) or not ts_exists(sb):
-            print("[INFO]   自动解决成功 ✅")
-            return True
+        window_info = sb.execute_script("""
+            return {
+                screenX: window.screenX || 0,
+                screenY: window.screenY || 0,
+                outerHeight: window.outerHeight,
+                innerHeight: window.innerHeight
+            };
+        """)
+        chrome_bar_height = max(0, window_info["outerHeight"] - window_info["innerHeight"])
+        abs_x = int(coords["click_x"] + window_info["screenX"])
+        abs_y = int(coords["click_y"] + window_info["screenY"] + chrome_bar_height)
     except Exception as e:
         if _is_fatal_driver_error(e):
             raise
+        print(f"[WARN]   获取窗口坐标失败: {e}")
+        return False
 
-    print("[INFO]   自动解决未完成，进入手动处理 ...")
-    start = time.time()
-    last_action = 0
-    while time.time() - start < timeout:
-        if ts_solved(sb):
-            print("[INFO]   Turnstile 令牌已生成 ✅")
-            return True
-        if not ts_exists(sb):
-            print("[INFO]   Turnstile 元素消失，可能已通过")
-            return True
-
-        expand_turnstile(sb)
-        focus_turnstile_area(sb)
-
-        now = time.time()
-        if now - last_action > 4:
-            clicked = False
+    print(f"[INFO]   使用 xdotool 隐身点击 CF 复选框 ({abs_x}, {abs_y})...")
+    disconnected = False
+    try:
+        if hasattr(sb, "disconnect"):
+            sb.disconnect()
+            disconnected = True
+            time.sleep(0.8)
+        xdotool_click(abs_x, abs_y)
+        time.sleep(6)
+    finally:
+        if disconnected and hasattr(sb, "reconnect"):
             try:
-                iframes = sb.driver.find_elements("css selector", "iframe")
-                for iframe in iframes:
-                    try:
-                        sb.driver.switch_to.frame(iframe)
-                        for sel in ["input[type='checkbox']", "label.cb-lb", ".cb-lb input"]:
-                            try:
-                                elem = sb.driver.find_element("css selector", sel)
-                                if elem.is_displayed():
-                                    elem.click()
-                                    clicked = True
-                                    print(f"[INFO]   在 iframe 中点击了 {sel}")
-                                    break
-                            except Exception:
-                                pass
-                        if clicked:
-                            break
-                    except Exception:
-                        pass
-                    finally:
-                        sb.driver.switch_to.default_content()
+                sb.reconnect(5)
+            except Exception as e:
+                print(f"[WARN]   reconnect 异常: {e}")
+    return True
+
+
+def handle_turnstile(sb, timeout=110, screenshot_prefix=""):
+    """处理 Cloudflare 全屏验证页，严禁使用 switch_to.frame 或样式篡改干扰"""
+    if not is_cf_challenge(sb):
+        return True
+
+    print("[INFO]   检测到 Cloudflare 验证页，先等待 5 秒观察自动通过...")
+    if wait_cf_cleared(sb, 5):
+        print(f"[INFO]   CF 自动通过 ✅ (cf_clearance: {has_cf_clearance(sb)})")
+        return True
+
+    start = time.time()
+    attempt = 0
+
+    while time.time() - start < timeout:
+        attempt += 1
+        if not is_cf_challenge(sb):
+            if wait_cf_cleared(sb, 2):
+                print(f"[INFO]   CF 验证通过 ✅ (cf_clearance: {has_cf_clearance(sb)})")
+                return True
+
+        if attempt == 1:
+            print("[INFO]   [尝试1] 调用 uc_gui_handle_captcha()...")
+            try:
+                sb.uc_gui_handle_captcha()
             except Exception as e:
                 if _is_fatal_driver_error(e):
                     raise
-                print(f"[WARN]   iframe 点击异常: {e}")
-            finally:
-                try:
-                    sb.driver.switch_to.default_content()
-                except Exception:
-                    pass
+                print(f"[WARN]   uc_gui_handle_captcha 异常: {e}")
+            if wait_cf_cleared(sb, 10):
+                print(f"[INFO]   CF 验证通过 ✅ (cf_clearance: {has_cf_clearance(sb)})")
+                return True
+        elif attempt % 2 == 0:
+            print(f"[INFO]   [尝试{attempt}] 调用 uc_gui_click_captcha()...")
+            try:
+                sb.uc_gui_click_captcha()
+            except Exception as e:
+                if _is_fatal_driver_error(e):
+                    raise
+                print(f"[WARN]   uc_gui_click_captcha 异常: {e}")
+            if wait_cf_cleared(sb, 10):
+                print(f"[INFO]   CF 验证通过 ✅ (cf_clearance: {has_cf_clearance(sb)})")
+                return True
+        else:
+            print(f"[INFO]   [尝试{attempt}] 坐标定位 + 隐身点击...")
+            click_cf_checkbox_stealth(sb)
+            if wait_cf_cleared(sb, 8):
+                print(f"[INFO]   CF 验证通过 ✅ (cf_clearance: {has_cf_clearance(sb)})")
+                return True
 
-            if not clicked:
-                try:
-                    sb.uc_gui_click_captcha()
-                    print("[INFO]   已调用 uc_gui_click_captcha（备用）")
-                except Exception as e:
-                    if _is_fatal_driver_error(e):
-                        raise
-            last_action = now
-
-        time.sleep(2)
-
-    print("[ERROR]  Turnstile 手动处理超时 ❌")
+    try:
+        cur_url = sb.get_current_url()
+        cur_title = sb.get_title()
+    except Exception:
+        cur_url, cur_title = "Unknown", "Unknown"
+    print(f"[ERROR]  Cloudflare 验证超时 ❌ | URL: {cur_url} | Title: {cur_title}")
+    if screenshot_prefix:
+        try:
+            sb.save_screenshot(f"{screenshot_prefix}_cf_fail.png")
+        except Exception:
+            pass
     return False
 
 
 # ============================================================
-#  Turnstile 处理（续期阶段）
+#  Turnstile 处理（续期弹窗阶段）
 # ============================================================
 
 def check_turnstile_exists_popup(sb):
@@ -1320,42 +1441,6 @@ def get_turnstile_checkbox_coords(sb):
         return None
 
 
-def activate_browser_window():
-    try:
-        result = subprocess.run(
-            ["xdotool", "search", "--onlyvisible", "--class", "chrome"],
-            capture_output=True, text=True, timeout=3
-        )
-        window_ids = result.stdout.strip().split('\n')
-        if window_ids and window_ids[0]:
-            subprocess.run(
-                ["xdotool", "windowactivate", window_ids[0]],
-                timeout=2, stderr=subprocess.DEVNULL
-            )
-            time.sleep(0.2)
-            return True
-    except Exception:
-        pass
-    return False
-
-
-def xdotool_click(x, y):
-    x, y = int(x), int(y)
-    activate_browser_window()
-    try:
-        subprocess.run(["xdotool", "mousemove", str(x), str(y)], timeout=2, stderr=subprocess.DEVNULL)
-        time.sleep(0.15)
-        subprocess.run(["xdotool", "click", "1"], timeout=2, stderr=subprocess.DEVNULL)
-        return True
-    except Exception:
-        pass
-    try:
-        os.system(f"xdotool mousemove {x} {y} click 1 2>/dev/null")
-        return True
-    except Exception:
-        return False
-
-
 def click_turnstile_checkbox(sb):
     coords = get_turnstile_checkbox_coords(sb)
     if not coords:
@@ -1366,7 +1451,7 @@ def click_turnstile_checkbox(sb):
             return {screenX:window.screenX||0, screenY:window.screenY||0,
                     outerHeight:window.outerHeight, innerHeight:window.innerHeight};
         """)
-        chrome_bar_height = window_info["outerHeight"] - window_info["innerHeight"]
+        chrome_bar_height = max(0, window_info["outerHeight"] - window_info["innerHeight"])
         abs_x = coords["click_x"] + window_info["screenX"]
         abs_y = coords["click_y"] + window_info["screenY"] + chrome_bar_height
         return xdotool_click(abs_x, abs_y)
@@ -1595,6 +1680,8 @@ def check_renewal_button_enabled(sb):
 
 def is_logged_in(sb):
     try:
+        if is_cf_challenge(sb):
+            return False
         url = sb.get_current_url()
         if "/login" in url or "/auth" in url:
             return False
@@ -1680,14 +1767,17 @@ def process_single_server(sb, server_info, cookie_name, cookie_value, cookie_str
     try:
         safe_open(sb, server_url)
         time.sleep(3)
-        if ts_exists(sb):
-            handle_turnstile(sb)
+        if is_cf_challenge(sb):
+            handle_turnstile(sb, screenshot_prefix=screenshot_prefix)
             time.sleep(2)
 
         if not is_logged_in(sb):
             sb.add_cookie({"name": cookie_name, "value": cookie_value, "domain": DOMAIN, "path": "/"})
             safe_open(sb, server_url)
             time.sleep(3)
+            if is_cf_challenge(sb):
+                handle_turnstile(sb, screenshot_prefix=screenshot_prefix)
+                time.sleep(2)
 
         if not is_logged_in(sb):
             ss_path = f"{screenshot_prefix}_login_fail.png"
@@ -1806,6 +1896,7 @@ def process_single_account(sb, account, account_index, proxy_desc="直连"):
     cookie_str = account.get("cookie_str", "")
     cookie_name = account.get("cookie_name", "")
     cookie_value = account.get("cookie_value", "")
+    acc_prefix = f"acc{account_index + 1}"
 
     result = {
         "remark": remark,
@@ -1816,44 +1907,61 @@ def process_single_account(sb, account, account_index, proxy_desc="直连"):
         "servers": [],
         "cookie_updated": False,
         "proxy_desc": proxy_desc,
+        "screenshot": None,
     }
 
-    # Step 1: Turnstile (登录阶段，仅首次访问用 uc_open_with_reconnect)
+    # Step 1: 访问站点并通过 Cloudflare 验证
     print("[INFO] [步骤1] 访问站点并处理 Cloudflare 验证...")
-    sb.uc_open_with_reconnect(f"https://{DOMAIN}/", reconnect_time=5)
-    if not handle_turnstile(sb):
-        print("[ERROR] Turnstile 验证失败")
+    sb.uc_open_with_reconnect(f"https://{DOMAIN}/", reconnect_time=6)
+    if not handle_turnstile(sb, timeout=110, screenshot_prefix=acc_prefix):
+        print("[ERROR] Cloudflare 验证未通过")
         result["status"] = "error"
-        result["message"] = "Cloudflare Turnstile 验证失败"
+        result["message"] = "Cloudflare 验证未通过（请检查节点 IP 质量或重试）"
+        cf_ss = f"{acc_prefix}_cf_fail.png"
+        if os.path.exists(cf_ss):
+            result["screenshot"] = cf_ss
         return result
-    print("[INFO] ✅ CF 验证通过")
 
-    # Step 2: 注入 Cookie 并登录（使用常规跳转，不再断连 ChromeDriver）
+    print(f"[INFO] ✅ 已离开 CF 验证页 | URL: {sb.get_current_url()} | Title: {sb.get_title()}")
+
+    # Step 2: 注入 Cookie 并登录
     print("[INFO] [步骤2] 注入 Cookie 并登录...")
     sb.add_cookie({"name": cookie_name, "value": cookie_value, "domain": DOMAIN, "path": "/"})
     safe_open(sb, f"https://{DOMAIN}/")
     time.sleep(3)
 
-    if ts_exists(sb):
-        handle_turnstile(sb)
+    if is_cf_challenge(sb):
+        print("[WARN]   注入 Cookie 刷新后再次遇到 CF 验证，重新处理...")
+        if not handle_turnstile(sb, timeout=90, screenshot_prefix=acc_prefix):
+            result["status"] = "error"
+            result["message"] = "登录后再次触发 Cloudflare 验证且未通过"
+            cf_ss = f"{acc_prefix}_cf_fail.png"
+            if os.path.exists(cf_ss):
+                result["screenshot"] = cf_ss
+            return result
         time.sleep(2)
 
     if not is_logged_in(sb):
-        print(f"[WARN]   未检测到登录状态 (当前 URL: {sb.get_current_url()})，尝试刷新...")
+        print(f"[WARN]   未检测到登录状态 (URL: {sb.get_current_url()} | Title: {sb.get_title()})，尝试刷新...")
         safe_open(sb, f"https://{DOMAIN}/server/")
         time.sleep(3)
-        if ts_exists(sb):
-            handle_turnstile(sb)
+        if is_cf_challenge(sb):
+            handle_turnstile(sb, timeout=90, screenshot_prefix=acc_prefix)
             time.sleep(2)
 
     if not is_logged_in(sb):
-        ss_path = f"acc{account_index + 1}_login_fail.png"
+        ss_path = f"{acc_prefix}_login_fail.png"
         try:
             sb.save_screenshot(ss_path)
+            result["screenshot"] = ss_path
         except Exception:
             pass
-        result["status"] = "cookie_invalid"
-        result["message"] = "Cookie 失效或登录失败（Turnstile 通过后仍无法登录）"
+        if is_cf_challenge(sb):
+            result["status"] = "error"
+            result["message"] = "仍被 Cloudflare 验证拦截（非 Cookie 失效）"
+        else:
+            result["status"] = "cookie_invalid"
+            result["message"] = f"Cookie 失效或登录失败 (URL: {sb.get_current_url()})"
         return result
 
     xsrf_token = get_xsrf_token_from_cookies(sb)
@@ -1924,7 +2032,7 @@ def process_single_account(sb, account, account_index, proxy_desc="直连"):
     server_results = []
     current_cookie_value = cookie_value
     for srv_idx, server in enumerate(servers):
-        ss_prefix = f"acc{account_index + 1}_srv{srv_idx + 1}"
+        ss_prefix = f"{acc_prefix}_srv{srv_idx + 1}"
         srv_result = process_single_server(
             sb, server, cookie_name, current_cookie_value, cookie_str, cookie_env, remark, ss_prefix
         )
@@ -2007,6 +2115,7 @@ def run_account_isolated(account, account_index):
             "locale": "ko",
             "headless": False,
             "chromium_arg": (
+                "--window-position=0,0,--window-size=1920,1080,"
                 "--disable-dev-shm-usage,--no-sandbox,--disable-gpu,"
                 "--disable-software-rasterizer,--disable-background-timer-throttling"
             ),
@@ -2132,6 +2241,8 @@ def send_account_notification(result):
             if s.get("screenshot") and os.path.exists(s["screenshot"]):
                 screenshot = s["screenshot"]
                 break
+    if not screenshot and result.get("screenshot") and os.path.exists(result["screenshot"]):
+        screenshot = result["screenshot"]
 
     if screenshot:
         if len(message) <= 1000:
