@@ -25,8 +25,8 @@ jobs:
 
       - name: 安装系统依赖
         run: |
-          sudo apt-get update
-          sudo apt-get install -y xvfb x11-utils fonts-nanum fonts-noto-cjk xdotool scrot
+          sudo apt-get update -o Acquire::Retries=3
+          sudo apt-get install -y --no-install-recommends xvfb xdotool scrot python3-tk
 
       - name: 安装 sing-box
         run: |
@@ -60,7 +60,7 @@ jobs:
           PROXY_NODES: ${{ secrets.PROXY_NODES }}
           # 节点失效时是否回退直连（设为 false 可强制严格隔离）
           PROXY_FALLBACK_DIRECT: "true"
-          # 检测到服务器 offline 时是否自动开机
+          # 检测到服务器 offline / 수면중 时是否自动开机
           AUTO_START_OFFLINE: "true"
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
