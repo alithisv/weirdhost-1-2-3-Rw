@@ -28,6 +28,16 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y xvfb x11-utils fonts-nanum fonts-noto-cjk xdotool scrot
 
+      - name: 安装 sing-box
+        run: |
+          SB_VERSION="1.11.4"
+          curl -fsSL -o sing-box.tar.gz "https://github.com/SagerNet/sing-box/releases/download/v${SB_VERSION}/sing-box-${SB_VERSION}-linux-amd64.tar.gz"
+          tar -xzf sing-box.tar.gz
+          sudo mv "sing-box-${SB_VERSION}-linux-amd64/sing-box" /usr/local/bin/sing-box
+          sudo chmod +x /usr/local/bin/sing-box
+          rm -rf sing-box.tar.gz "sing-box-${SB_VERSION}-linux-amd64"
+          sing-box version
+
       - name: 安装 Python 依赖
         run: |
           python -m pip install --upgrade pip
@@ -40,6 +50,16 @@ jobs:
           WEIRDHOST_COOKIE_3: ${{ secrets.WEIRDHOST_COOKIE_3 }}
           WEIRDHOST_COOKIE_4: ${{ secrets.WEIRDHOST_COOKIE_4 }}
           WEIRDHOST_COOKIE_5: ${{ secrets.WEIRDHOST_COOKIE_5 }}
+          # 方式 A：一对一绑定节点（优先级高于 PROXY_NODES）
+          PROXY_NODE_1: ${{ secrets.PROXY_NODE_1 }}
+          PROXY_NODE_2: ${{ secrets.PROXY_NODE_2 }}
+          PROXY_NODE_3: ${{ secrets.PROXY_NODE_3 }}
+          PROXY_NODE_4: ${{ secrets.PROXY_NODE_4 }}
+          PROXY_NODE_5: ${{ secrets.PROXY_NODE_5 }}
+          # 方式 B：节点池（每行一个节点链接，按账号顺序自动分配）
+          PROXY_NODES: ${{ secrets.PROXY_NODES }}
+          # 节点失效时是否回退直连（设为 false 可强制严格隔离，节点挂了则跳过该账号）
+          PROXY_FALLBACK_DIRECT: "true"
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           REPO_TOKEN: ${{ secrets.REPO_TOKEN }}
