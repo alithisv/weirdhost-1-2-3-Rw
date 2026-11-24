@@ -58,8 +58,10 @@ jobs:
           PROXY_NODE_5: ${{ secrets.PROXY_NODE_5 }}
           # 方式 B：节点池（每行一个节点链接，按账号顺序自动分配）
           PROXY_NODES: ${{ secrets.PROXY_NODES }}
-          # 节点失效时是否回退直连（设为 false 可强制严格隔离，节点挂了则跳过该账号）
+          # 节点失效时是否回退直连（设为 false 可强制严格隔离）
           PROXY_FALLBACK_DIRECT: "true"
+          # 检测到服务器 offline 时是否自动开机
+          AUTO_START_OFFLINE: "true"
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
           REPO_TOKEN: ${{ secrets.REPO_TOKEN }}
