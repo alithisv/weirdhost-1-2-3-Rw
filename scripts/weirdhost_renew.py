@@ -159,7 +159,7 @@ def parse_weirdhost_cookie(cookie_str):
     if "=" in cookie_str:
         parts = cookie_str.split("=", 1)
         if len(parts) == 2:
-            raw_val = parts[1].strip()
+            raw_val = parts[1].strip().rstrip(";")
             return (parts[0].strip(), unquote(raw_val), raw_val)
     return (None, None, None)
 
@@ -564,7 +564,6 @@ class SingBoxProxyManager:
             urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url})
         )
 
-        # 优先获取出口 IP + 国家 + 时区
         try:
             req = urllib.request.Request(
                 "http://ip-api.com/json/?fields=status,query,countryCode,timezone",
@@ -865,22 +864,43 @@ def get_cookies_normalized(sb):
     return normalized
 
 
-def inject_cookie_cdp(sb, cookie_name, raw_cookie_value, domain=DOMAIN):
-    """在 CDP 模式下写入登录 Cookie 并校验是否写入成功"""
-    cdp_js(
-        sb,
-        """
-        document.cookie = arguments[0] + "=" + arguments[1] +
-            "; path=/; domain=" + arguments[2] + "; Secure; SameSite=Lax";
-        """,
-        cookie_name,
-        raw_cookie_value,
-        domain,
-    )
-    cookies = get_cookies_normalized(sb)
-    found = any(c["name"] == cookie_name and c["value"] for c in cookies)
-    if not found:
-        # 兜底不带 domain 属性写入当前域
+def inject_cookie_cdp(sb, cookie_name, cookie_value, domain=DOMAIN, clear_session=True):
+    """优先使用底层 CDP Network.setCookie 写入 host-only HttpOnly Cookie，并清理匿名 session"""
+    method_used = "document.cookie"
+
+    try:
+        import mycdp
+        loop = getattr(sb.cdp, "loop", None)
+        page = getattr(sb.cdp, "page", None)
+        if loop and page:
+            if clear_session:
+                for cname in ("pterodactyl_session", cookie_name):
+                    try:
+                        loop.run_until_complete(
+                            page.send(mycdp.network.delete_cookies(name=cname, url=f"https://{domain}/"))
+                        )
+                    except Exception:
+                        pass
+            ok = loop.run_until_complete(
+                page.send(
+                    mycdp.network.set_cookie(
+                        name=cookie_name,
+                        value=cookie_value,
+                        url=f"https://{domain}/",
+                        path="/",
+                        secure=True,
+                        http_only=True,
+                        same_site=mycdp.network.CookieSameSite.LAX,
+                    )
+                )
+            )
+            if ok:
+                method_used = "cdp.network.set_cookie"
+    except Exception as e:
+        print(f"[WARN]   CDP 原生写 Cookie 降级 ({e})")
+
+    if method_used == "document.cookie":
+        # 不带 domain= 属性，确保为 host-only，与服务端下发一致
         cdp_js(
             sb,
             """
@@ -888,11 +908,12 @@ def inject_cookie_cdp(sb, cookie_name, raw_cookie_value, domain=DOMAIN):
                 "; path=/; Secure; SameSite=Lax";
             """,
             cookie_name,
-            raw_cookie_value,
+            cookie_value,
         )
-        cookies = get_cookies_normalized(sb)
-        found = any(c["name"] == cookie_name and c["value"] for c in cookies)
-    return found
+
+    cookies = get_cookies_normalized(sb)
+    found = any(c["name"] == cookie_name and c["value"] for c in cookies)
+    return found, method_used
 
 
 def get_xsrf_token_from_cookies(sb):
@@ -956,7 +977,7 @@ def _cdp_fetch_internal(sb, url, method="GET", headers=None, payload=None, timeo
     return res
 
 
-def api_fetch_json(sb, url, xsrf_token=None):
+def api_fetch_json(sb, url, xsrf_token=None, quiet=False):
     headers = {
         "Accept": "application/json",
         "X-Requested-With": "XMLHttpRequest",
@@ -967,21 +988,25 @@ def api_fetch_json(sb, url, xsrf_token=None):
 
     res = _cdp_fetch_internal(sb, url, method="GET", headers=headers)
     if res.get("error"):
-        print(f"[ERROR]   fetch 失败: {res['error']}")
+        if not quiet:
+            print(f"[ERROR]   fetch 失败: {res['error']}")
         return None
     status = res.get("status", 0)
     if status == 401:
-        print("[ERROR]   fetch 失败: unauthorized (401)")
+        if not quiet:
+            print("[ERROR]   fetch 失败: unauthorized (401)")
         return {"error": "unauthorized"}
     if status == 204:
         return {"_ok": True, "_status": 204}
     if not res.get("ok"):
-        print(f"[ERROR]   fetch 失败: HTTP {status}")
+        if not quiet:
+            print(f"[ERROR]   fetch 失败: HTTP {status}")
         return None
     try:
         return json.loads(res.get("text", ""))
     except Exception:
-        print(f"[ERROR]   fetch 返回非 JSON: {str(res.get('text', ''))[:100]}")
+        if not quiet:
+            print(f"[ERROR]   fetch 返回非 JSON: {str(res.get('text', ''))[:100]}")
         return None
 
 
@@ -1035,13 +1060,13 @@ def cdp_click_xpath(sb, xpath):
 
 
 # ============================================================
-#  服务器电源状态检测与离线自动开机
+#  服务器电源状态检测与离线/休眠自动开机
 # ============================================================
 
 def get_power_state_from_api(sb, server_id, xsrf_token=None):
     if not server_id or server_id == "Unknown":
         return None
-    res = api_fetch_json(sb, f"{API_BASE_URL}/servers/{server_id}/resources", xsrf_token)
+    res = api_fetch_json(sb, f"{API_BASE_URL}/servers/{server_id}/resources", xsrf_token, quiet=True)
     if isinstance(res, dict):
         state = res.get("attributes", {}).get("current_state")
         if state:
@@ -1049,8 +1074,8 @@ def get_power_state_from_api(sb, server_id, xsrf_token=None):
     return None
 
 
-def get_power_buttons_from_dom(sb):
-    """读取页面 Start / Stop 按钮状态，精确全词匹配避免误点 Restart"""
+def get_power_dom_info(sb):
+    """读取页面 Start / Restart / Stop 按钮状态及休眠/离线文案"""
     try:
         return cdp_js(
             sb,
@@ -1068,18 +1093,22 @@ def get_power_buttons_from_dom(sb):
                 }
                 return {found: false, disabled: true, text: ''};
             }
+            var body = (document.body && document.body.innerText ? document.body.innerText : '');
             return {
                 start: findBtn(['start', '시작']),
-                stop: findBtn(['stop', '정지', '중지'])
+                restart: findBtn(['restart', '재시작']),
+                stop: findBtn(['stop', '정지', '중지']),
+                is_hibernating: body.includes('수면중') || body.includes('접속하면 자동으로 깨어나요'),
+                is_offline_text: body.includes('오프라인')
             };
             """
-        ) or {"start": {"found": False, "disabled": True}, "stop": {"found": False, "disabled": True}}
+        ) or {}
     except Exception:
-        return {"start": {"found": False, "disabled": True}, "stop": {"found": False, "disabled": True}}
+        return {}
 
 
 def click_start_button_dom(sb):
-    """在页面上精确查找并点击未禁用的 Start 按钮"""
+    """在页面上精确查找并点击未禁用的 Start 按钮（全词匹配避免误点 Restart）"""
     try:
         return bool(cdp_js(
             sb,
@@ -1106,24 +1135,30 @@ def click_start_button_dom(sb):
 
 
 def detect_server_power_state(sb, server_id, xsrf_token=None):
-    """综合 API 与 DOM 按钮判断服务器当前状态"""
+    """综合 API 与 DOM（含 Weirdhost 休眠状态 수면중）判断服务器当前状态"""
     api_state = get_power_state_from_api(sb, server_id, xsrf_token)
+    dom = get_power_dom_info(sb)
+
     if api_state:
+        if api_state in ("offline", "hibernating", "sleeping"):
+            return ("hibernating" if dom.get("is_hibernating") else "offline"), "api"
         return api_state, "api"
 
-    dom = get_power_buttons_from_dom(sb)
     start_btn = dom.get("start", {})
     stop_btn = dom.get("stop", {})
-    if start_btn.get("found"):
-        if not start_btn.get("disabled") and stop_btn.get("disabled"):
-            return "offline", "dom"
-        if start_btn.get("disabled") and not stop_btn.get("disabled"):
-            return "running", "dom"
+    if dom.get("is_hibernating"):
+        return "hibernating", "dom"
+    if start_btn.get("found") and not start_btn.get("disabled"):
+        return "offline", "dom"
+    if dom.get("is_offline_text"):
+        return "offline", "dom"
+    if start_btn.get("found") and start_btn.get("disabled") and not stop_btn.get("disabled"):
+        return "running", "dom"
     return "unknown", "none"
 
 
 def ensure_server_online(sb, server_id, xsrf_token=None):
-    """检查服务器是否 online，若为 offline 则自动点击开机（含 API 兜底）"""
+    """检查服务器是否 online，若为 offline 或休眠中(수면중)则自动点击开机（含 API 兜底）"""
     if not _parse_bool(os.environ.get("AUTO_START_OFFLINE", "true")):
         return {"state": "skipped", "action": "disabled", "label": "已关闭检测"}
 
@@ -1145,16 +1180,16 @@ def ensure_server_online(sb, server_id, xsrf_token=None):
         print("  [INFO] 服务器正在开机中，无需重复操作")
         return {"state": "starting", "action": "none", "label": "🟡 启动中"}
 
-    if state != "offline":
+    if state not in ("offline", "hibernating"):
         print(f"  [WARN] 无法确认服务器状态 ({state})，跳过自动开机")
         return {"state": state, "action": "unknown", "label": f"❓ 未知({state})"}
 
-    # 状态为 offline -> 执行开机
-    print("  [INFO] 服务器处于 offline，尝试点击 Start 按钮开机...")
+    # 状态为 offline / hibernating -> 执行开机
+    print(f"  [INFO] 服务器处于 {state}，尝试点击 Start 按钮开机...")
     clicked = click_start_button_dom(sb)
     if clicked:
         print("  [INFO] 已点击 Start 按钮，等待状态更新...")
-        cdp_sleep(sb, 4)
+        cdp_sleep(sb, 5)
         new_state, _ = detect_server_power_state(sb, server_id, xsrf_token)
         if new_state in ("running", "starting"):
             print(f"  [INFO] ✅ 服务器开机成功（当前状态: {new_state}）")
@@ -1173,15 +1208,15 @@ def ensure_server_online(sb, server_id, xsrf_token=None):
         )
         if isinstance(post_res, dict) and post_res.get("_ok"):
             print("  [INFO] API 开机指令已发送，等待状态更新...")
-            cdp_sleep(sb, 4)
+            cdp_sleep(sb, 5)
             new_state, _ = detect_server_power_state(sb, server_id, xsrf_token)
             if new_state in ("running", "starting"):
                 print(f"  [INFO] ✅ API 兜底开机成功（当前状态: {new_state}）")
                 return {"state": new_state, "action": "started", "label": f"⚡ 已自动开机({new_state})"}
             return {"state": new_state, "action": "start_sent", "label": f"⚡ 已发送开机({new_state})"}
 
-    print("  [ERROR] ❌ 自动开机失败，服务器仍为 offline")
-    return {"state": "offline", "action": "start_failed", "label": "❌ 离线(开机失败)"}
+    print(f"  [ERROR] ❌ 自动开机失败，服务器仍为 {state}")
+    return {"state": state, "action": "start_failed", "label": f"❌ {state}(开机失败)"}
 
 
 # ============================================================
@@ -1272,7 +1307,7 @@ def has_cf_clearance(sb):
 
 
 def is_cf_challenge(sb):
-    """判断是否处于 Cloudflare 全屏验证页（兼容韩/英及 Closed Shadow DOM）"""
+    """判断是否处于 Cloudflare 全屏验证页（兼容韩/英/中及 Closed Shadow DOM）"""
     try:
         return bool(cdp_js(
             sb,
@@ -1284,13 +1319,16 @@ def is_cf_challenge(sb):
                 title.includes('잠시만') ||
                 title.includes('attention required') ||
                 title.includes('보안 확인') ||
-                title.includes('checking your browser')
+                title.includes('checking your browser') ||
+                title.includes('请稍候')
             ) {
                 return true;
             }
             if (
                 body.includes('보안 확인 수행 중') ||
                 body.includes('사람인지 확인하십시오') ||
+                body.includes('正在进行安全验证') ||
+                body.includes('请验证您是真人') ||
                 body.includes('performing security verification') ||
                 body.includes('verify you are human') ||
                 body.includes('verifying you are human') ||
@@ -1462,7 +1500,6 @@ def handle_turnstile(sb, target_url=None, screenshot_prefix=""):
                     print(f"[INFO]   刷新后 CF 自动通过 ✅ (cf_clearance: {has_cf_clearance(sb)})")
                     return True
 
-        # 动作 A：SeleniumBase 内置 solve_captcha
         try:
             method_name = call_sb_solve_captcha(sb)
             print(f"[INFO]   [第{round_idx}轮-A] 已调用 {method_name}，等待 8s...")
@@ -1476,7 +1513,6 @@ def handle_turnstile(sb, target_url=None, screenshot_prefix=""):
                 print(f"[INFO]   CF 验证通过 ✅ (cf_clearance: {has_cf_clearance(sb)})")
                 return True
 
-        # 动作 B：坐标定位 + xdotool 物理点击
         print(f"[INFO]   [第{round_idx}轮-B] 坐标定位 + xdotool 点击...")
         found_xy = click_cf_checkbox_cdp(sb, cached_abs=cached_abs, wait_after=10)
         if found_xy:
@@ -1778,7 +1814,7 @@ def handle_renewal_popup(sb, screenshot_prefix="", timeout=90):
 
 
 # ============================================================
-#  页面交互（CDP Mode）
+#  页面交互与登录态校验（CDP Mode）
 # ============================================================
 
 def get_expiry_from_page(sb):
@@ -1829,20 +1865,43 @@ def check_renewal_button_enabled(sb):
     return (True, True, xpath, "")
 
 
-def is_logged_in(sb):
+def is_logged_in(sb, allow_api_check=True):
+    """综合 URL、标题、DOM 特征和 /api/client 接口校验登录状态"""
     try:
         if is_cf_challenge(sb):
             return False
-        url = sb.cdp.get_current_url() or ""
+        url = (sb.cdp.get_current_url() or "").lower()
         if "/login" in url or "/auth" in url:
             return False
+
+        title = (sb.cdp.get_title() or "").lower()
+        if "dashboard" in title:
+            return True
+
         if get_expiry_from_page(sb) != "Unknown":
             return True
         if find_renewal_button(sb):
             return True
-        if cdp_is_xpath_present(sb, "//div[contains(@class,'ServerControls')]") or \
-           cdp_is_xpath_present(sb, "//a[contains(@href,'/server/')]"):
+
+        has_panel_dom = bool(cdp_js(
+            sb,
+            """
+            var body = (document.body && document.body.innerText ? document.body.innerText : '');
+            return body.includes('SERVER CONTROLS') ||
+                   body.includes('무료 서버 신청') ||
+                   body.includes('삭제된 서버') ||
+                   !!document.querySelector('a[href*="/server/"]');
+            """
+        ))
+        if has_panel_dom:
             return True
+
+        if allow_api_check:
+            xsrf = get_xsrf_token_from_cookies(sb)
+            probe = api_fetch_json(sb, f"{API_BASE_URL}?page=1", xsrf, quiet=True)
+            if isinstance(probe, dict) and isinstance(probe.get("data"), list):
+                return True
+
         return False
     except Exception:
         return False
@@ -1931,7 +1990,7 @@ def process_single_server(sb, server_info, cookie_name, cookie_value, raw_cookie
 
         print("  [INFO] 登录成功")
 
-        # 检查服务器在线状态，若 offline 自动开机
+        # 检查服务器在线状态，若 offline / 수면중 自动开机
         xsrf_token = get_xsrf_token_from_cookies(sb)
         power_res = ensure_server_online(sb, server_id, xsrf_token)
         srv_result["power_label"] = power_res.get("label", "未知")
@@ -2029,6 +2088,29 @@ def process_single_server(sb, server_info, cookie_name, cookie_value, raw_cookie
 #  单个账号处理（纯 CDP Mode）
 # ============================================================
 
+def _try_login_with_cookie(sb, cookie_name, val_to_inject, home_url, acc_prefix, tag="原始值"):
+    """写入 Cookie 并访问首页验证是否登录成功"""
+    injected, method_used = inject_cookie_cdp(sb, cookie_name, val_to_inject, DOMAIN, clear_session=True)
+    print(f"[INFO]   Cookie({tag}, 长度={len(val_to_inject)}) 写入: {'成功' if injected else '未确认'} ({method_used})")
+    cdp_open(sb, home_url, wait=4)
+
+    if is_cf_challenge(sb):
+        print("[WARN]   注入 Cookie 刷新后再次遇到 CF 验证，重新处理...")
+        if not handle_turnstile(sb, target_url=home_url, screenshot_prefix=acc_prefix):
+            return "cf_blocked"
+        cdp_sleep(sb, 2)
+
+    if is_logged_in(sb):
+        return "ok"
+
+    # 再等待 3 秒防止 SPA 页面还在渲染
+    cdp_sleep(sb, 3)
+    if is_logged_in(sb):
+        return "ok"
+
+    return "not_logged_in"
+
+
 def process_single_account(sb, account, account_index, proxy_desc="直连"):
     remark = account.get("remark", f"账号{account_index + 1}")
     cookie_env = account.get("cookie_env", "")
@@ -2071,46 +2153,43 @@ def process_single_account(sb, account, account_index, proxy_desc="直连"):
 
     print(f"[INFO] ✅ 已离开 CF 验证页 | URL: {sb.cdp.get_current_url()} | Title: {sb.cdp.get_title()}")
 
-    # Step 2: 注入 Cookie 并登录
+    # Step 2: 注入 Cookie 并登录（优先原始值；若带 URL 编码且失败则自动用解码值重试）
     print("[INFO] [步骤2] 注入 Cookie 并登录...")
-    injected = inject_cookie_cdp(sb, cookie_name, raw_cookie_value, DOMAIN)
-    print(f"[INFO]   Cookie 写入状态: {'成功' if injected else '未确认'}")
-    cdp_open(sb, home_url, wait=4)
+    active_raw_cookie = raw_cookie_value
+    login_state = _try_login_with_cookie(sb, cookie_name, raw_cookie_value, home_url, acc_prefix, tag="原始值")
 
-    if is_cf_challenge(sb):
-        print("[WARN]   注入 Cookie 刷新后再次遇到 CF 验证，重新处理...")
-        if not handle_turnstile(sb, target_url=home_url, screenshot_prefix=acc_prefix):
-            result["status"] = "error"
-            result["message"] = "登录后再次触发 Cloudflare 验证且未通过"
-            cf_ss = f"{acc_prefix}_cf_fail.png"
-            if os.path.exists(cf_ss):
-                result["screenshot"] = cf_ss
-            return result
-        cdp_sleep(sb, 2)
+    if login_state == "not_logged_in" and cookie_value != raw_cookie_value:
+        print("[WARN]   原始值未登录，尝试使用 URL 解码值重新注入...")
+        login_state = _try_login_with_cookie(sb, cookie_name, cookie_value, home_url, acc_prefix, tag="解码值")
+        if login_state == "ok":
+            active_raw_cookie = cookie_value
 
-    if not is_logged_in(sb):
-        print(f"[WARN]   未检测到登录状态 (URL: {sb.cdp.get_current_url()} | Title: {sb.cdp.get_title()})，尝试访问 /server/...")
-        cdp_open(sb, f"https://{DOMAIN}/server/", wait=4)
-        if is_cf_challenge(sb):
-            handle_turnstile(sb, target_url=f"https://{DOMAIN}/server/", screenshot_prefix=acc_prefix)
-            cdp_sleep(sb, 2)
+    if login_state == "cf_blocked":
+        result["status"] = "error"
+        result["message"] = "登录后再次触发 Cloudflare 验证且未通过"
+        cf_ss = f"{acc_prefix}_cf_fail.png"
+        if os.path.exists(cf_ss):
+            result["screenshot"] = cf_ss
+        return result
 
-    if not is_logged_in(sb):
+    if login_state != "ok":
         ss_path = f"{acc_prefix}_login_fail.png"
         if safe_screenshot(sb, ss_path):
             result["screenshot"] = ss_path
+        cur_url = sb.cdp.get_current_url()
+        cur_title = sb.cdp.get_title()
         if is_cf_challenge(sb):
             result["status"] = "error"
             result["message"] = "仍被 Cloudflare 验证拦截（非 Cookie 失效）"
         else:
             result["status"] = "cookie_invalid"
-            result["message"] = f"Cookie 失效或登录失败 (URL: {sb.cdp.get_current_url()})"
+            result["message"] = f"Cookie 已失效，请重新获取并更新 {cookie_env} (URL: {cur_url} | Title: {cur_title})"
         return result
 
     xsrf_token = get_xsrf_token_from_cookies(sb)
-    print("[INFO]   登录成功，已获取会话 Cookie")
+    print(f"[INFO] ✅ 登录成功 | URL: {sb.cdp.get_current_url()} | Title: {sb.cdp.get_title()}")
 
-    # Step 3: 获取信息
+    # Step 3: 获取账号与服务器列表
     print("[INFO] [步骤3] 获取账号信息...")
     server_data = api_fetch_json(sb, f"{API_BASE_URL}?page=1", xsrf_token)
     if not server_data or server_data.get("error") == "unauthorized":
@@ -2174,7 +2253,7 @@ def process_single_account(sb, account, account_index, proxy_desc="直连"):
     print("[INFO] [步骤4] 逐个处理服务器电源检测与续期...")
     server_results = []
     current_cookie_value = cookie_value
-    current_raw_cookie_value = raw_cookie_value
+    current_raw_cookie_value = active_raw_cookie
     for srv_idx, server in enumerate(servers):
         ss_prefix = f"{acc_prefix}_srv{srv_idx + 1}"
         srv_result = process_single_server(
@@ -2339,7 +2418,7 @@ def send_account_notification(result):
     ]
 
     if status == "cookie_invalid":
-        lines.append("状态：⚠️ Cookie 已失效，请及时更新 WEIRDHOST_COOKIE_*")
+        lines.append(f"状态：⚠️ {html.escape(str(result.get('message', 'Cookie 已失效，请及时更新 WEIRDHOST_COOKIE_*')))}")
     elif status == "no_server":
         lines.append("状态：⚠️ 没有服务器")
     elif status == "error" and not servers:
