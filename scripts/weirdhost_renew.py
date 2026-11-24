@@ -4,6 +4,7 @@
 import os
 import sys
 import time
+import html
 import asyncio
 import aiohttp
 import base64
@@ -472,9 +473,20 @@ class SingBoxProxyManager:
         self.proxy_uri = proxy_uri
         self.process = None
         self.config_path = None
+        self.log_path = None
+        self._log_fp = None
         self.local_port = None
         self.label = ""
         self.egress_ip = None
+
+    def _read_stderr_tail(self, limit=300):
+        if not self.log_path or not os.path.exists(self.log_path):
+            return ""
+        try:
+            with open(self.log_path, "r", encoding="utf-8", errors="ignore") as f:
+                return f.read().strip()[-limit:]
+        except Exception:
+            return ""
 
     def start(self, verify_timeout=12):
         outbound, label = parse_proxy_uri(self.proxy_uri)
@@ -507,12 +519,14 @@ class SingBoxProxyManager:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(config, f, ensure_ascii=False, indent=2)
 
+        log_fd, self.log_path = tempfile.mkstemp(prefix="singbox_", suffix=".log")
+        self._log_fp = os.fdopen(log_fd, "w", encoding="utf-8")
+
         try:
             self.process = subprocess.Popen(
                 ["sing-box", "run", "-c", self.config_path],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
+                stdout=subprocess.DEVNULL,
+                stderr=self._log_fp,
             )
         except FileNotFoundError:
             self.stop()
@@ -525,7 +539,7 @@ class SingBoxProxyManager:
         port_ready = False
         for _ in range(30):
             if self.process.poll() is not None:
-                err_out = (self.process.stderr.read() or "").strip()[:300]
+                err_out = self._read_stderr_tail()
                 self.stop()
                 return False, f"sing-box 启动后立即退出: {err_out}"
             try:
@@ -536,8 +550,9 @@ class SingBoxProxyManager:
                 time.sleep(0.2)
 
         if not port_ready:
+            err_out = self._read_stderr_tail()
             self.stop()
-            return False, "sing-box 本地端口监听超时"
+            return False, f"sing-box 本地端口监听超时: {err_out}"
 
         # 连通性与出口 IP 预检
         proxy_url = f"http://127.0.0.1:{self.local_port}"
@@ -577,12 +592,21 @@ class SingBoxProxyManager:
                     pass
             self.process = None
 
-        if self.config_path and os.path.exists(self.config_path):
+        if self._log_fp:
             try:
-                os.remove(self.config_path)
+                self._log_fp.close()
             except Exception:
                 pass
-            self.config_path = None
+            self._log_fp = None
+
+        for path_attr in ("config_path", "log_path"):
+            p = getattr(self, path_attr, None)
+            if p and os.path.exists(p):
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
+                setattr(self, path_attr, None)
 
 
 def load_proxy_pool():
@@ -686,10 +710,13 @@ async def tg_notify(message):
         return
     async with aiohttp.ClientSession() as session:
         try:
-            await session.post(
+            async with session.post(
                 f"https://api.telegram.org/bot{token}/sendMessage",
                 json={"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
-            )
+            ) as resp:
+                if resp.status != 200:
+                    body = await resp.text()
+                    print(f"[ERROR] TG 文本发送异常 ({resp.status}): {body[:200]}")
         except Exception as e:
             print(f"[ERROR] TG 发送失败: {e}")
 
@@ -707,7 +734,12 @@ async def tg_notify_photo(photo_path, caption=""):
                 data.add_field("photo", f, filename=os.path.basename(photo_path))
                 data.add_field("caption", caption)
                 data.add_field("parse_mode", "HTML")
-                await session.post(f"https://api.telegram.org/bot{token}/sendPhoto", data=data)
+                async with session.post(
+                    f"https://api.telegram.org/bot{token}/sendPhoto", data=data
+                ) as resp:
+                    if resp.status != 200:
+                        body = await resp.text()
+                        print(f"[ERROR] TG 图片发送异常 ({resp.status}): {body[:200]}")
         except Exception as e:
             print(f"[ERROR] TG 图片发送失败: {e}")
 
@@ -776,9 +808,16 @@ def api_fetch_json(sb, url, xsrf_token=None):
         fetch(arguments[0], {
             headers: arguments[1]
         })
-        .then(resp => {
+        .then(async resp => {
             if (resp.status === 401) return {_error: 'unauthorized'};
-            return resp.json();
+            if (resp.status === 204) return {_ok: true, _status: 204};
+            var text = await resp.text();
+            if (!resp.ok) return {_error: 'http_' + resp.status, _body: text.slice(0, 120)};
+            try {
+                return JSON.parse(text);
+            } catch (e) {
+                return {_error: 'invalid_json', _body: text.slice(0, 120)};
+            }
         })
         .then(data => done(data))
         .catch(err => done({_error: err.toString()}));
@@ -790,6 +829,34 @@ def api_fetch_json(sb, url, xsrf_token=None):
     return result
 
 
+def api_post_json(sb, url, payload, xsrf_token=None):
+    headers = {
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "X-Requested-With": "XMLHttpRequest",
+        "Referer": f"https://{DOMAIN}/",
+    }
+    if xsrf_token:
+        headers["X-XSRF-TOKEN"] = xsrf_token
+
+    script = """
+        var done = arguments[arguments.length - 1];
+        fetch(arguments[0], {
+            method: 'POST',
+            headers: arguments[1],
+            body: JSON.stringify(arguments[2])
+        })
+        .then(async resp => {
+            if (resp.status === 204 || resp.ok) return {_ok: true, _status: resp.status};
+            var text = await resp.text();
+            return {_ok: false, _status: resp.status, _body: text.slice(0, 120)};
+        })
+        .then(data => done(data))
+        .catch(err => done({_ok: false, _error: err.toString()}));
+    """
+    return sb.driver.execute_async_script(script, url, headers, payload)
+
+
 def get_xsrf_token_from_cookies(sb):
     try:
         cookies = sb.get_cookies()
@@ -799,6 +866,150 @@ def get_xsrf_token_from_cookies(sb):
     except Exception:
         pass
     return None
+
+
+# ============================================================
+#  服务器电源状态检测与离线自动开机
+# ============================================================
+
+def get_power_state_from_api(sb, server_id, xsrf_token=None):
+    if not server_id or server_id == "Unknown":
+        return None
+    res = api_fetch_json(sb, f"{API_BASE_URL}/servers/{server_id}/resources", xsrf_token)
+    if isinstance(res, dict):
+        state = res.get("attributes", {}).get("current_state")
+        if state:
+            return str(state).strip().lower()
+    return None
+
+
+def get_power_buttons_from_dom(sb):
+    """读取页面 Start / Stop 按钮状态，精确全词匹配避免误点 Restart"""
+    try:
+        return sb.execute_script("""
+            var buttons = Array.from(document.querySelectorAll('button'));
+            function findBtn(labels) {
+                for (var i = 0; i < buttons.length; i++) {
+                    var txt = (buttons[i].innerText || buttons[i].textContent || '').trim().toLowerCase();
+                    if (labels.includes(txt)) {
+                        var disabled = !!buttons[i].disabled ||
+                            buttons[i].getAttribute('aria-disabled') === 'true' ||
+                            buttons[i].classList.contains('disabled');
+                        return {found: true, disabled: disabled, text: txt};
+                    }
+                }
+                return {found: false, disabled: true, text: ''};
+            }
+            return {
+                start: findBtn(['start', '시작']),
+                stop: findBtn(['stop', '정지', '중지'])
+            };
+        """)
+    except Exception:
+        return {"start": {"found": False, "disabled": True}, "stop": {"found": False, "disabled": True}}
+
+
+def click_start_button_dom(sb):
+    """在页面上精确查找并点击未禁用的 Start 按钮"""
+    try:
+        return sb.execute_script("""
+            var buttons = Array.from(document.querySelectorAll('button'));
+            for (var i = 0; i < buttons.length; i++) {
+                var txt = (buttons[i].innerText || buttons[i].textContent || '').trim().toLowerCase();
+                if (txt === 'start' || txt === '시작') {
+                    var disabled = !!buttons[i].disabled ||
+                        buttons[i].getAttribute('aria-disabled') === 'true' ||
+                        buttons[i].classList.contains('disabled');
+                    if (!disabled) {
+                        buttons[i].scrollIntoView({block: 'center', inline: 'center'});
+                        buttons[i].click();
+                        return true;
+                    }
+                }
+            }
+            return false;
+        """)
+    except Exception:
+        return False
+
+
+def detect_server_power_state(sb, server_id, xsrf_token=None):
+    """综合 API 与 DOM 按钮判断服务器当前状态"""
+    api_state = get_power_state_from_api(sb, server_id, xsrf_token)
+    if api_state:
+        return api_state, "api"
+
+    dom = get_power_buttons_from_dom(sb)
+    start_btn = dom.get("start", {})
+    stop_btn = dom.get("stop", {})
+    if start_btn.get("found"):
+        if not start_btn.get("disabled") and stop_btn.get("disabled"):
+            return "offline", "dom"
+        if start_btn.get("disabled") and not stop_btn.get("disabled"):
+            return "running", "dom"
+    return "unknown", "none"
+
+
+def ensure_server_online(sb, server_id, xsrf_token=None):
+    """检查服务器是否 online，若为 offline 则自动点击开机（含 API 兜底）"""
+    if not _parse_bool(os.environ.get("AUTO_START_OFFLINE", "true")):
+        return {"state": "skipped", "action": "disabled", "label": "已关闭检测"}
+
+    print("  [INFO] 检查服务器电源状态...")
+    state, source = detect_server_power_state(sb, server_id, xsrf_token)
+    print(f"  [INFO] 当前电源状态: {state} (来源: {source})")
+
+    if state == "stopping":
+        print("  [INFO] 服务器正在停止，等待 8 秒后复检...")
+        time.sleep(8)
+        state, source = detect_server_power_state(sb, server_id, xsrf_token)
+        print(f"  [INFO] 复检电源状态: {state} (来源: {source})")
+
+    if state == "running":
+        print("  [INFO] 服务器已在线，无需开机")
+        return {"state": "running", "action": "none", "label": "🟢 在线"}
+
+    if state == "starting":
+        print("  [INFO] 服务器正在开机中，无需重复操作")
+        return {"state": "starting", "action": "none", "label": "🟡 启动中"}
+
+    if state != "offline":
+        print(f"  [WARN] 无法确认服务器状态 ({state})，跳过自动开机")
+        return {"state": state, "action": "unknown", "label": f"❓ 未知({state})"}
+
+    # 状态为 offline -> 执行开机
+    print("  [INFO] 服务器处于 offline，尝试点击 Start 按钮开机...")
+    clicked = click_start_button_dom(sb)
+    if clicked:
+        print("  [INFO] 已点击 Start 按钮，等待状态更新...")
+        time.sleep(4)
+        new_state, _ = detect_server_power_state(sb, server_id, xsrf_token)
+        if new_state in ("running", "starting"):
+            print(f"  [INFO] ✅ 服务器开机成功（当前状态: {new_state}）")
+            return {"state": new_state, "action": "started", "label": f"⚡ 已自动开机({new_state})"}
+        print(f"  [WARN] 点击 Start 后状态仍为 {new_state}，尝试 API 兜底开机...")
+    else:
+        print("  [WARN] 页面未点击到可用 Start 按钮，尝试 API 兜底开机...")
+
+    # API 兜底开机
+    if server_id and server_id != "Unknown":
+        post_res = api_post_json(
+            sb,
+            f"{API_BASE_URL}/servers/{server_id}/power",
+            {"signal": "start"},
+            xsrf_token,
+        )
+        if isinstance(post_res, dict) and post_res.get("_ok"):
+            print("  [INFO] API 开机指令已发送，等待状态更新...")
+            time.sleep(4)
+            new_state, _ = detect_server_power_state(sb, server_id, xsrf_token)
+            if new_state in ("running", "starting"):
+                print(f"  [INFO] ✅ API 兜底开机成功（当前状态: {new_state}）")
+                return {"state": new_state, "action": "started", "label": f"⚡ 已自动开机({new_state})"}
+            return {"state": new_state, "action": "start_sent", "label": f"⚡ 已发送开机({new_state})"}
+
+    print("  [ERROR] ❌ 自动开机失败，服务器仍为 offline")
+    return {"state": "offline", "action": "start_failed", "label": "❌ 离线(开机失败)"}
 
 
 # ============================================================
@@ -1143,7 +1354,7 @@ def check_popup_still_open(sb):
             for (var i = 0; i < buttons.length; i++) {
                 var text = buttons[i].innerText || '';
                 if ((text.includes('시간추가') || text.includes('시간 추가') || text.includes('연장하기'))
-                    && !text.includes('DELETE')) {
+                    && !text.includes('DELETE') && !text.includes('삭제')) {
                     var rect = buttons[i].getBoundingClientRect();
                     if (rect.x > 200 && rect.width > 0) return true;
                 }
@@ -1296,13 +1507,13 @@ def check_renewal_button_enabled(sb):
         return (False, False, None, "页面上未找到续期按钮")
 
     try:
-        is_disabled = sb.execute_script(f"""
-            var btn = document.evaluate("{xpath}", document, null,
+        is_disabled = sb.execute_script("""
+            var btn = document.evaluate(arguments[0], document, null,
                 XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
             if (!btn) return null;
             return btn.disabled || btn.getAttribute('aria-disabled') === 'true'
                    || btn.classList.contains('disabled');
-        """)
+        """, xpath)
         if is_disabled is None:
             return (False, False, None, "按钮元素无法访问")
         if is_disabled:
@@ -1358,7 +1569,7 @@ def check_and_update_cookie(sb, cookie_env, original_cookie_value, remark=""):
 
 
 # ============================================================
-#  单个服务器续期处理
+#  单个服务器续期与保活开机处理
 # ============================================================
 
 def process_single_server(sb, server_info, cookie_name, cookie_value, cookie_str,
@@ -1375,6 +1586,7 @@ def process_single_server(sb, server_info, cookie_name, cookie_value, cookie_str
         "server_type": server_type,
         "server_name": server_name,
         "status": "unknown",
+        "power_label": "未检测",
         "original_expiry": api_expiry,
         "new_expiry": api_expiry,
         "message": "",
@@ -1409,6 +1621,11 @@ def process_single_server(sb, server_info, cookie_name, cookie_value, cookie_str
             return srv_result
 
         print("  [INFO] 登录成功")
+
+        # 检查服务器在线状态，若 offline 自动开机
+        xsrf_token = get_xsrf_token_from_cookies(sb)
+        power_res = ensure_server_online(sb, server_id, xsrf_token)
+        srv_result["power_label"] = power_res.get("label", "未知")
 
         page_expiry = get_expiry_from_page(sb)
         if page_expiry != "Unknown":
@@ -1616,7 +1833,7 @@ def process_single_account(sb, account, account_index, proxy_desc="直连"):
         print(f"  - {mask_server_id(s['identifier'])} [{s['server_type']}] {s['name']} | 到期: {s['expire']}")
 
     # Step 4: 逐个处理服务器
-    print("[INFO] [步骤4] 逐个处理服务器续期...")
+    print("[INFO] [步骤4] 逐个处理服务器电源检测与续期...")
     server_results = []
     current_cookie_value = cookie_value
     for srv_idx, server in enumerate(servers):
@@ -1745,10 +1962,10 @@ def send_account_notification(result):
     status = result.get("status", "unknown")
     proxy_desc = result.get("proxy_desc", "直连")
 
-    account_display = email if email and email != "Unknown" else remark
+    account_display = html.escape(str(email if email and email != "Unknown" else remark))
     lines = [
         f"账号：{account_display}",
-        f"出口：{proxy_desc}",
+        f"出口：{html.escape(str(proxy_desc))}",
     ]
 
     if status == "cookie_invalid":
@@ -1756,20 +1973,22 @@ def send_account_notification(result):
     elif status == "no_server":
         lines.append("状态：⚠️ 没有服务器")
     elif status == "error" and not servers:
-        lines.append(f"状态：❌ {result.get('message', '未知错误')}")
+        lines.append(f"状态：❌ {html.escape(str(result.get('message', '未知错误')))}")
     else:
         for s in servers:
             lines.append("")
-            lines.append(f"服务器：{s.get('server_id', '')}")
+            lines.append(f"服务器：{html.escape(str(s.get('server_id', '')))}")
+            if s.get("power_label"):
+                lines.append(f"电源：{html.escape(str(s['power_label']))}")
             srv_status = s["status"]
 
             if srv_status == "success":
                 lines.append("状态：🟢 续期成功")
                 new_exp = s.get("new_expiry", "Unknown")
-                lines.append(f"剩余：{calculate_remaining_time(new_exp)}")
+                lines.append(f"剩余：{html.escape(calculate_remaining_time(new_exp))}")
                 msg = s.get("message", "")
                 if msg and "延长" in msg:
-                    lines.append(f"延长：{msg}")
+                    lines.append(f"延长：{html.escape(msg)}")
                 else:
                     orig = s.get("original_expiry", "Unknown")
                     new = s.get("new_expiry", "Unknown")
@@ -1782,16 +2001,16 @@ def send_account_notification(result):
             elif srv_status == "cooldown":
                 lines.append("状态：⏳ 冷却期")
                 expiry = s.get("original_expiry", "Unknown")
-                lines.append(f"剩余：{calculate_remaining_time(expiry)}")
+                lines.append(f"剩余：{html.escape(calculate_remaining_time(expiry))}")
                 lines.append("提示：冷却中，请稍后再试")
             elif srv_status == "skipped":
                 lines.append("状态：⏭️ 跳过")
                 expiry = s.get("original_expiry", s.get("new_expiry", "Unknown"))
-                lines.append(f"剩余：{calculate_remaining_time(expiry)}")
-                lines.append(f"原因：{s.get('message', '未知')}")
+                lines.append(f"剩余：{html.escape(calculate_remaining_time(expiry))}")
+                lines.append(f"原因：{html.escape(str(s.get('message', '未知')))}")
             else:
-                lines.append(f"状态：❌ {srv_status}")
-                lines.append(f"信息：{s.get('message', '未知')}")
+                lines.append(f"状态：❌ {html.escape(str(srv_status))}")
+                lines.append(f"信息：{html.escape(str(s.get('message', '未知')))}")
 
     if cookie_updated:
         lines.append("")
@@ -1810,7 +2029,11 @@ def send_account_notification(result):
                 break
 
     if screenshot:
-        sync_tg_notify_photo(screenshot, message)
+        if len(message) <= 1000:
+            sync_tg_notify_photo(screenshot, message)
+        else:
+            sync_tg_notify_photo(screenshot, f"账号：{account_display} 续期截图")
+            sync_tg_notify(message)
     else:
         sync_tg_notify(message)
 
@@ -1841,7 +2064,7 @@ def add_server_time():
         return
 
     print("=" * 60)
-    print("[INFO] Weirdhost 多账号自动续期 (独立浏览器 + sing-box 代理隔离)")
+    print("[INFO] Weirdhost 多账号自动续期 (独立浏览器 + sing-box 代理 + 离线自动开机)")
     print(f"[INFO] 共 {len(accounts)} 个账号")
     print("=" * 60)
 
